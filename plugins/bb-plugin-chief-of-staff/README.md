@@ -23,6 +23,15 @@ worker thread:
 - **Kept moving.** The monitor nudges idle workers that go quiet, auto-retries
   a failed turn once, flags genuinely stalled tasks, respects the
   concurrency budget, and notices tasks completed or unassigned in Vikunja.
+- **Feature routing.** Tasks labelled `feature` (or with a `feature: <name>`
+  line) are driven through the rateyourfood `feature-delivery` workflow by a
+  cheap driver worker (ZCode GLM-5.3-Flash) with frozen args; one feature run
+  at a time (`maxFeatureRuns`); `done` only after `merged-to-main` (or
+  `delivered` when the task asked for a deploy). Plain tasks get a GLM-5.3
+  implementer that merges its branch into local main when tests pass.
+- **Reversible work proceeds, irreversible work waits.** Irreversible or
+  high-impact questions bypass the policies, never time out, and a dismissal
+  means no. Push/deploy is allowed only when the task explicitly asked for it.
 - **Briefings.** A running digest — decisions pending, in flight, stalled,
   completed — in the panel and via `bb chief brief`.
 

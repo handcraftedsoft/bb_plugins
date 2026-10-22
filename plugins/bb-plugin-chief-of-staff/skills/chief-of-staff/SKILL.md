@@ -41,3 +41,19 @@ Operating constraints:
   the built-ins cover branches, tests, commits, dependencies, and formatting.
 - Worker threads titled `#<task-id> <title>` report through
   chief_of_staff_report; a `done` report closes the Vikunja task.
+- **Routing:** a task labelled `feature` (setting `featureLabel`) or whose
+  description has a `feature: <kebab-name>` line is a *feature*: its worker
+  (ZCode GLM-5.3-Flash) only drives the `feature-delivery` bb workflow with
+  frozen args, and its `done` is accepted only once the workflow returned
+  `merged-to-main` (or `delivered` when the task asked for a deploy). At most
+  `maxFeatureRuns` (default 1) feature runs at once. Other tasks get a plain
+  implementer (ZCode GLM-5.3) that merges its worktree branch into local main
+  once tests pass.
+- **Reversible vs irreversible:** code, docs, tests, local commits and merging
+  into local main need no approval. Irreversible/high-impact questions
+  (deleting data, destructive migrations, secrets, paid actions, external
+  messages, production the task did not ask for) skip the policies, wait for
+  Denis without a timeout, and a dismissal means **no**
+  (`chief_of_staff_ask` with `kind: "irreversible"`, also detected from the
+  question text). Push/deploy questions are auto-allowed only when the task
+  text explicitly asked for a push/deploy/release.
