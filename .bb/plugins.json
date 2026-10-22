@@ -1,0 +1,23 @@
+{
+  "$schema": "https://getbb.app/schemas/plugins.schema.json",
+  "schemaVersion": 1,
+  "name": "handcraftedsoft-bb-plugins",
+  "plugins": [
+    {
+      "name": "starter",
+      "source": "./plugins/bb-plugin-starter"
+    },
+    {
+      "name": "folders",
+      "source": "./plugins/bb-plugin-folders"
+    },
+    {
+      "name": "vikunja",
+      "source": "./plugins/bb-plugin-vikunja"
+    },
+    {
+      "name": "chief-of-staff",
+      "source": "./plugins/bb-plugin-chief-of-staff"
+    }
+  ]
+}
