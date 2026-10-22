@@ -11,7 +11,7 @@ import { cliCommand, defineCli, defineRpcContract, PluginCliError, type BbPlugin
 import { z } from "zod";
 import { ChiefOfStaff } from "./runtime";
 import { ChiefStore, SCHEMA } from "./store";
-import { parseKeywords, type CosSettings, type TaskRow } from "./logic";
+import { parseKeywords, workerInstructions, type CosSettings, type TaskMode, type TaskRow } from "./logic";
 
 const taskViewSchema = z.object({
   taskId: z.number().int(),
@@ -25,6 +25,9 @@ const taskViewSchema = z.object({
   nudgeCount: z.number().int(),
   error: z.string().nullable(),
   threadStatus: z.string().nullable(),
+  mode: z.enum(["feature", "task"]),
+  deployRequested: z.boolean(),
+  workflowStatus: z.string().nullable(),
 });
 
 const decisionViewSchema = z.object({
@@ -39,6 +42,7 @@ const decisionViewSchema = z.object({
   autoAnswered: z.boolean(),
   askedAt: z.number(),
   answeredAt: z.number().nullable(),
+  kind: z.enum(["routine", "irreversible"]),
 });
 
 const policyViewSchema = z.object({
@@ -136,6 +140,13 @@ const DEFAULTS: CosSettings = {
   maxNudges: 2,
   pollSeconds: 60,
   decisionTimeoutHours: 24,
+  featureLabel: "feature",
+  workflowName: "feature-delivery",
+  maxFeatureRuns: 1,
+  workerProvider: "zcode",
+  featureWorkerModel: "account:zai-individual-coding-plan/GLM-5.3-Flash",
+  taskWorkerModel: "account:zai-individual-coding-plan/GLM-5.3",
+  workerReasoning: "high",
 };
 
 function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -145,8 +156,8 @@ function clampInt(value: number | undefined, fallback: number, min: number, max:
 
 /** Worker instructions for one managed thread; the title is quoted so
  * thread-controlled text reads as data, not directions. */
-function workerInstructionsFor(title: string): string {
-  return `You are working a Chief of Staff task: ${JSON.stringify(title)}. Use chief_of_staff_report to report progress and completion, and chief_of_staff_ask only when blocked on a question you cannot decide. If the ask tool errors or times out, proceed with your best judgment and note it in your final report.`;
+function workerInstructionsFor(title: string, mode: TaskMode): string {
+  return workerInstructions(title, mode);
 }
 
 export default async function plugin(bb: BbPluginApi) {
@@ -191,11 +202,59 @@ export default async function plugin(bb: BbPluginApi) {
     },
     decisionTimeoutHours: {
       type: "number",
-      label: "Hours to wait for a decision",
+      label: "Hours a routine question waits (irreversible decisions never time out)",
       default: DEFAULTS.decisionTimeoutHours,
       experimental_schema: z.number().int().min(1).max(168),
     },
+    featureLabel: {
+      type: "string",
+      label: "Vikunja label that routes a task through the feature workflow",
+      default: DEFAULTS.featureLabel,
+      experimental_schema: z.string().trim().min(1).max(60),
+    },
+    workflowName: {
+      type: "string",
+      label: "bb workflow for feature tasks (.bb/workflows/<name>.js)",
+      default: DEFAULTS.workflowName,
+      experimental_schema: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/, "lowercase kebab-case"),
+    },
+    maxFeatureRuns: {
+      type: "number",
+      label: "Feature workflow runs at once (24 GB RAM: keep 1)",
+      default: DEFAULTS.maxFeatureRuns,
+      experimental_schema: z.number().int().min(1).max(4),
+    },
+    workerProvider: {
+      type: "string",
+      label: "Worker provider (empty = project default)",
+      default: DEFAULTS.workerProvider,
+      experimental_schema: z.string().trim().max(80),
+    },
+    featureWorkerModel: {
+      type: "string",
+      label: "Model for feature drivers (they only run the workflow)",
+      default: DEFAULTS.featureWorkerModel,
+      experimental_schema: z.string().trim().max(200),
+    },
+    taskWorkerModel: {
+      type: "string",
+      label: "Model for plain task workers (they implement)",
+      default: DEFAULTS.taskWorkerModel,
+      experimental_schema: z.string().trim().max(200),
+    },
+    workerReasoning: {
+      type: "string",
+      label: "Worker reasoning level (empty = provider default)",
+      default: DEFAULTS.workerReasoning,
+      experimental_schema: z.string().trim().max(20),
+    },
   });
+
+  function str(value: unknown, fallback: string, allowEmpty = false): string {
+    if (typeof value !== "string") return fallback;
+    const trimmed = value.trim();
+    return trimmed === "" && !allowEmpty ? fallback : trimmed;
+  }
 
   async function readSettings(): Promise<CosSettings> {
     const values = await settings.get();
@@ -211,6 +270,13 @@ export default async function plugin(bb: BbPluginApi) {
       maxNudges: clampInt(values.maxNudges, DEFAULTS.maxNudges, 1, 5),
       pollSeconds: clampInt(values.pollSeconds, DEFAULTS.pollSeconds, 15, 600),
       decisionTimeoutHours: clampInt(values.decisionTimeoutHours, DEFAULTS.decisionTimeoutHours, 1, 168),
+      featureLabel: str(values.featureLabel, DEFAULTS.featureLabel),
+      workflowName: str(values.workflowName, DEFAULTS.workflowName),
+      maxFeatureRuns: clampInt(values.maxFeatureRuns, DEFAULTS.maxFeatureRuns, 1, 4),
+      workerProvider: str(values.workerProvider, DEFAULTS.workerProvider, true),
+      featureWorkerModel: str(values.featureWorkerModel, DEFAULTS.featureWorkerModel, true),
+      taskWorkerModel: str(values.taskWorkerModel, DEFAULTS.taskWorkerModel, true),
+      workerReasoning: str(values.workerReasoning, DEFAULTS.workerReasoning, true),
     };
   }
 
@@ -248,9 +314,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "chief_of_staff_ask",
     description:
-      "Ask your chief of staff a question. Returns immediately when standing policy covers it; otherwise it waits for the user's decision and may take hours. Only call when blocked on a question you cannot decide yourself.",
+      "Ask your chief of staff a question. Routine questions return immediately when standing policy covers it, otherwise wait for the user (may take hours). Use kind 'irreversible' before any irreversible or high-impact action (deleting data, destructive migrations, secrets, paid actions, external messages, production the task did not ask for): it always reaches Denis and never times out.",
     instructions:
-      "chief_of_staff_ask reaches the user through the Chief of Staff plugin. Try to decide routine matters yourself; ask only when genuinely blocked. If it errors or times out, proceed with your best judgment and note the decision in your final report.",
+      "chief_of_staff_ask reaches the user through the Chief of Staff plugin. Reversible work (code, docs, tests, local commits, merge to local main once all passes) needs no question. Ask routine questions only when genuinely blocked; if a routine ask errors or times out, proceed with your best judgment and note it. Irreversible actions need kind 'irreversible' and an explicit yes — never proceed on a dismissal, error, or timeout.",
     presentation: {
       label: {
         pending: "Asking the chief of staff",
@@ -261,16 +327,17 @@ export default async function plugin(bb: BbPluginApi) {
       question: z.string().min(3).max(2000),
       context: z.string().max(2000).optional(),
       options: z.array(z.string().max(200)).max(6).optional(),
+      kind: z.enum(["routine", "irreversible"]).optional(),
     }),
-    async execute({ question, context, options }, ctx) {
-      return chief.ask(ctx.threadId, { question, context, options }, ctx.signal);
+    async execute({ question, context, options, kind }, ctx) {
+      return chief.ask(ctx.threadId, { question, context, options, kind }, ctx.signal);
     },
   });
 
   bb.agents.registerTool({
     name: "chief_of_staff_report",
     description:
-      "Report progress on your task: 'started' when you begin, 'progress' after each meaningful step, 'done' when complete (this closes the Vikunja task), 'failed' if you cannot finish, 'blocked' when you cannot proceed.",
+      "Report progress on your task: 'started' when you begin, 'progress' after each meaningful step, 'done' when complete (this closes the Vikunja task), 'failed' if you cannot finish, 'blocked' when you cannot proceed. Feature tasks pass workflowRunId/workflowStatus; their 'done' is accepted only once the workflow returned merged-to-main (or delivered, when the task asked for a deploy).",
     presentation: {
       label: {
         pending: "Reporting to the chief of staff",
@@ -280,9 +347,11 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: z.object({
       stage: z.enum(["started", "progress", "done", "failed", "blocked"]),
       note: z.string().max(1000).optional(),
+      workflowRunId: z.string().max(200).optional(),
+      workflowStatus: z.string().max(80).optional(),
     }),
-    execute({ stage, note }, ctx) {
-      return chief.report(ctx.threadId, stage, note ?? null);
+    execute({ stage, note, workflowRunId, workflowStatus }, ctx) {
+      return chief.report(ctx.threadId, stage, note ?? null, { runId: workflowRunId, status: workflowStatus });
     },
   });
 
@@ -292,10 +361,11 @@ export default async function plugin(bb: BbPluginApi) {
       return { tools: [], skills: [] };
     }
     const title = context.thread.title;
+    const mode: TaskMode = context.pluginMetadata.mode === "feature" ? "feature" : "task";
     return {
       tools: ["chief_of_staff_ask", "chief_of_staff_report"],
       skills: [],
-      ...(title === null ? {} : { instructions: workerInstructionsFor(title) }),
+      ...(title === null ? {} : { instructions: workerInstructionsFor(title, mode) }),
     };
   });
 
@@ -363,6 +433,7 @@ export default async function plugin(bb: BbPluginApi) {
       nudgeCount: task.nudgeCount,
       error: task.error,
       threadStatus,
+      ...chief.metaView(task.taskId),
     };
   }
 
@@ -381,6 +452,7 @@ export default async function plugin(bb: BbPluginApi) {
       autoAnswered: decision.autoAnswered === 1,
       askedAt: decision.askedAt,
       answeredAt: decision.answeredAt,
+      kind: store.decisionKind(decision.id),
     };
   }
 
@@ -417,7 +489,7 @@ export default async function plugin(bb: BbPluginApi) {
               rows
                 .map(
                   (task) =>
-                    `#${task.taskId} (${task.state}) ${task.title}${task.progressNote === null ? "" : ` — ${task.progressNote}`}${task.error === null ? "" : ` [${task.error}]`}`,
+                    `#${task.taskId} (${task.state}${chief.metaView(task.taskId).mode === "feature" ? `, feature${chief.metaView(task.taskId).workflowStatus === null ? "" : ` ${chief.metaView(task.taskId).workflowStatus}`}` : ""}) ${task.title}${task.progressNote === null ? "" : ` — ${task.progressNote}`}${task.error === null ? "" : ` [${task.error}]`}`,
                 )
                 .join("\n"),
             );
@@ -438,7 +510,7 @@ export default async function plugin(bb: BbPluginApi) {
                 : decisions
                     .map(
                       (decision) =>
-                        `${decision.status === "pending" ? "PENDING" : decision.status} ${decision.id} — ${decision.question}${decision.answer === null ? "" : ` → ${decision.answer}`}`,
+                        `${decision.status === "pending" ? "PENDING" : decision.status}${store.decisionKind(decision.id) === "irreversible" ? " [irreversible]" : ""} ${decision.id} — ${decision.question}${decision.answer === null ? "" : ` → ${decision.answer}`}`,
                     )
                     .join("\n"),
             );
@@ -473,7 +545,13 @@ export default async function plugin(bb: BbPluginApi) {
             if (decision === null) {
               throw new PluginCliError("no such decision", { code: "decision_not_found" });
             }
-            return { exitCode: 0, stdout: "Dismissed. The worker will proceed with its best judgment." };
+            return {
+              exitCode: 0,
+              stdout:
+                store.decisionKind(decision.id) === "irreversible"
+                  ? "Dismissed. The worker will NOT perform the irreversible action."
+                  : "Dismissed. The worker will proceed with its best judgment.",
+            };
           },
         }),
         policy: cliCommand({

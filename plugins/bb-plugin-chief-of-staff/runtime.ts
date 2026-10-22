@@ -9,18 +9,25 @@ import {
   buildBriefing,
   buildWorkerPrompt,
   CHANGED_CHANNEL,
+  classifyQuestion,
+  classifyTask,
   describeAnswer,
+  featureDoneAllowed,
+  operatingRules,
   filterByAssignee,
   matchPolicy,
   parseKeywords,
   parseVikunjaTasksPage,
   type BriefingRow,
   type CosSettings,
+  type DecisionKind,
   type DecisionRow,
   type PolicyRow,
   type ReportStage,
+  type TaskMeta,
   type TaskRow,
   type VikunjaTask,
+  type WorkerPlan,
 } from "./logic";
 import { ChiefStore } from "./store";
 
@@ -41,6 +48,9 @@ export interface TaskView {
   nudgeCount: number;
   error: string | null;
   threadStatus: string | null;
+  mode: TaskMeta["mode"];
+  deployRequested: boolean;
+  workflowStatus: string | null;
 }
 
 export interface DecisionView {
@@ -55,6 +65,7 @@ export interface DecisionView {
   autoAnswered: boolean;
   askedAt: number;
   answeredAt: number | null;
+  kind: DecisionKind;
 }
 
 export interface PolicyView {
@@ -85,6 +96,12 @@ export interface AskInput {
   question: string;
   context?: string;
   options?: string[];
+  kind?: DecisionKind;
+}
+
+export interface WorkflowReport {
+  runId?: string;
+  status?: string;
 }
 
 type AskOutcome = { kind: "answered"; answer: string } | { kind: "dismissed" } | { kind: "withdrawn" | "timeout" };
@@ -140,14 +157,48 @@ export class ChiefOfStaff {
 
   // ---- worker threads ----
 
-  private async spawnWorker(task: VikunjaTask, settings: CosSettings): Promise<string> {
-    const thread = await this.bb.sdk.threads.spawn({
+  private planFor(meta: TaskMeta, settings: CosSettings): WorkerPlan {
+    return {
+      mode: meta.mode,
+      feature: meta.feature,
+      deployRequested: meta.deployRequested,
+      workflowName: settings.workflowName,
+    };
+  }
+
+  /** Routing facts for a task: derived from the task text on first sight and
+   * kept afterwards (the workflow args are frozen at dispatch). */
+  private metaFor(task: VikunjaTask, settings: CosSettings): TaskMeta {
+    const existing = this.store.getTaskMeta(task.id);
+    if (existing !== null) return existing;
+    return this.store.setTaskMeta(task.id, classifyTask(task, settings.featureLabel));
+  }
+
+  private async spawnWorker(task: VikunjaTask, settings: CosSettings, meta: TaskMeta): Promise<string> {
+    const base = {
       projectId: settings.project,
-      environment: { type: "project-default" },
-      prompt: buildWorkerPrompt(task),
+      environment: { type: "project-default" } as const,
+      prompt: buildWorkerPrompt(task, this.planFor(meta, settings)),
       title: `#${task.id} ${task.title}`.slice(0, 120),
-      pluginMetadata: { itemId: String(task.id) },
-    });
+      pluginMetadata: { itemId: String(task.id), mode: meta.mode },
+    };
+    const model = meta.mode === "feature" ? settings.featureWorkerModel : settings.taskWorkerModel;
+    if (settings.workerProvider !== "" && model !== "") {
+      try {
+        const thread = await this.bb.sdk.threads.spawn({
+          ...base,
+          providerId: settings.workerProvider,
+          model,
+          ...(settings.workerReasoning === "" ? {} : { reasoningLevel: settings.workerReasoning }),
+        });
+        return thread.id;
+      } catch (cause) {
+        this.bb.log.warn(
+          `spawn with ${settings.workerProvider}/${model} failed (${cause instanceof Error ? cause.message : String(cause)}); retrying with the project default`,
+        );
+      }
+    }
+    const thread = await this.bb.sdk.threads.spawn(base);
     return thread.id;
   }
 
@@ -214,11 +265,12 @@ export class ChiefOfStaff {
   }
 
   /** Adopts a task that already has a linked thread (reuse, never respawn). */
-  private async adoptTask(task: VikunjaTask, threadId: string, now: number): Promise<void> {
+  private async adoptTask(task: VikunjaTask, threadId: string, now: number, settings: CosSettings): Promise<void> {
+    const meta = this.metaFor(task, settings);
     // The tools are gated on pluginMetadata.itemId; claim the thread so the
     // next turn constructs its session with chief_of_staff_* available.
     try {
-      await this.bb.sdk.threads.updatePluginMetadata({ threadId, set: { itemId: String(task.id) } });
+      await this.bb.sdk.threads.updatePluginMetadata({ threadId, set: { itemId: String(task.id), mode: meta.mode } });
     } catch (cause) {
       this.bb.log.warn(
         `claim thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -235,7 +287,12 @@ export class ChiefOfStaff {
     );
     await this.sendToThread(
       threadId,
-      `The Chief of Staff plugin now manages Vikunja task #${task.id} (${JSON.stringify(task.title)}). Continue working on it. From now on, report with chief_of_staff_report and, when blocked on the user, call chief_of_staff_ask.`,
+      [
+        `The Chief of Staff plugin now manages Vikunja task #${task.id} (${JSON.stringify(task.title)}). Continue working on it. From now on, report with chief_of_staff_report and, when blocked on the user, call chief_of_staff_ask.`,
+        "",
+        "Operating rules from now on:",
+        ...operatingRules(this.planFor(meta, settings)),
+      ].join("\n"),
     );
     this.bb.log.info(`adopted thread ${threadId} for task ${task.id}`);
   }
@@ -254,11 +311,27 @@ export class ChiefOfStaff {
     for (const candidate of [...links].reverse()) {
       const alive = await this.threadAlive(candidate);
       if (alive === null || alive.archivedAt !== null) continue;
-      await this.adoptTask(task, candidate, now);
+      await this.adoptTask(task, candidate, now, settings);
       await this.moveTaskToDoing(task);
       return;
     }
     // No reusable thread: spawn a fresh worker, within the concurrency budget.
+    const meta = this.metaFor(task, settings);
+    if (meta.mode === "feature") {
+      const running = this.store.countActiveFeatureTasks();
+      if (running >= settings.maxFeatureRuns) {
+        this.store.upsertTask(
+          { taskId: task.id, title: task.title, projectId: task.projectId, lastTaskUpdated: task.updated },
+          now,
+        );
+        this.store.updateTask(
+          task.id,
+          { state: "paused", error: `waiting for a feature-delivery slot (${running}/${settings.maxFeatureRuns})` },
+          now,
+        );
+        return;
+      }
+    }
     const active = this.store.listTasksWithState("active").length;
     if (active >= settings.maxConcurrent) {
       this.store.upsertTask(
@@ -270,7 +343,7 @@ export class ChiefOfStaff {
     }
     let threadId: string;
     try {
-      threadId = await this.spawnWorker(task, settings);
+      threadId = await this.spawnWorker(task, settings, meta);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       this.store.upsertTask(
@@ -301,7 +374,12 @@ export class ChiefOfStaff {
     );
     await this.registerLink(task.id, threadId);
     await this.moveTaskToDoing(task);
-    await this.commentOnTask(task, "Chief of Staff: dispatched a worker thread for this task.");
+    await this.commentOnTask(
+      task,
+      meta.mode === "feature"
+        ? `Chief of Staff: dispatched a worker that runs this through the \`${settings.workflowName}\` workflow (feature \`${meta.feature}\`${meta.deployRequested ? ", delivery requested" : ""}).`
+        : "Chief of Staff: dispatched a worker thread for this task.",
+    );
     this.bb.log.info(`spawned thread ${threadId} for task ${task.id}`);
   }
 
@@ -317,8 +395,13 @@ export class ChiefOfStaff {
       return "This thread is not a Chief of Staff worker, so nobody is watching for an answer. Decide yourself.";
     }
     const question = input.question.trim();
-    const policy = matchPolicy(question, this.store.listPolicies());
-    if (policy !== null) {
+    const meta = this.store.getTaskMeta(task.taskId);
+    const deployRequested = meta?.deployRequested ?? false;
+    const triage = classifyQuestion(`${question}\n${input.context ?? ""}`, deployRequested, input.kind);
+
+    if (triage === "deploy-allowed") {
+      const answer =
+        "This task explicitly asks for the push/deploy, so it is allowed: do it only after everything is merged to local main and all tests pass, push without force, use the documented deploy procedure for the affected area, and report what you did. Anything else irreversible still needs Denis.";
       this.store.insertDecision({
         itemId: String(task.taskId),
         threadId,
@@ -326,13 +409,34 @@ export class ChiefOfStaff {
         context: input.context ?? null,
         options: input.options ?? [],
         status: "answered",
-        answer: policy.answer,
+        answer,
         autoAnswered: true,
         answeredAt: Date.now(),
       });
-      void this.refreshBriefing();
+      this.briefSoon();
       this.publish();
-      return `ANSWER (chief of staff policy on "${policy.keywords.join(", ")}"): ${policy.answer}`;
+      return `ANSWER (chief of staff: deploy requested by the task): ${answer}`;
+    }
+
+    const kind: DecisionKind = triage === "irreversible" ? "irreversible" : "routine";
+    if (kind === "routine") {
+      const policy = matchPolicy(question, this.store.listPolicies());
+      if (policy !== null) {
+        this.store.insertDecision({
+          itemId: String(task.taskId),
+          threadId,
+          question,
+          context: input.context ?? null,
+          options: input.options ?? [],
+          status: "answered",
+          answer: policy.answer,
+          autoAnswered: true,
+          answeredAt: Date.now(),
+        });
+        this.briefSoon();
+        this.publish();
+        return `ANSWER (chief of staff policy on "${policy.keywords.join(", ")}"): ${policy.answer}`;
+      }
     }
 
     const decision = this.store.insertDecision({
@@ -342,9 +446,11 @@ export class ChiefOfStaff {
       context: input.context ?? null,
       options: input.options ?? [],
     });
+    this.store.setDecisionKind(decision.id, kind);
     this.publish();
-    this.bb.log.info(`decision ${decision.id} pending on task ${task.taskId}`);
-    const timeoutMs = (await this.readSettings()).decisionTimeoutHours * 60 * 60 * 1000;
+    this.bb.log.info(`${kind} decision ${decision.id} pending on task ${task.taskId}`);
+    // Irreversible decisions never time out into "best judgment".
+    const timeoutMs = kind === "irreversible" ? null : (await this.readSettings()).decisionTimeoutHours * 60 * 60 * 1000;
 
     return await new Promise<string>((resolve) => {
       let settled = false;
@@ -352,26 +458,24 @@ export class ChiefOfStaff {
         if (settled) return;
         settled = true;
         this.resolvers.delete(decision.id);
-        clearTimeout(timer);
+        if (timer !== null) clearTimeout(timer);
         signal.removeEventListener("abort", onAbort);
         if (outcome.kind === "answered") {
-          resolve(describeAnswer("answered", outcome.answer));
+          resolve(describeAnswer("answered", outcome.answer, kind));
         } else if (outcome.kind === "dismissed") {
-          resolve(describeAnswer("dismissed", ""));
+          resolve(describeAnswer("dismissed", "", kind));
         } else if (outcome.kind === "timeout") {
           this.store.updateDecision(decision.id, { status: "dismissed", answer: null, answeredAt: Date.now() });
-          resolve(describeAnswer("timeout", ""));
+          resolve(describeAnswer("timeout", "", kind));
         } else {
           // Withdrawn (thread stopped/archived/deleted, or plugin disposal):
           // nobody can answer it through the tool any more, so it must not
           // linger in the panel as pending.
           this.store.updateDecision(decision.id, { status: "dismissed", answer: null, answeredAt: Date.now() });
-          resolve(
-            "The question was withdrawn (thread stopped or the chief of staff restarted). Proceed with your best judgment and note it in your final report.",
-          );
+          resolve(describeAnswer("withdrawn", "", kind));
         }
       };
-      const timer = setTimeout(() => settle({ kind: "timeout" }), timeoutMs);
+      const timer = timeoutMs === null ? null : setTimeout(() => settle({ kind: "timeout" }), timeoutMs);
       const onAbort = () => settle({ kind: "withdrawn" });
       signal.addEventListener("abort", onAbort, { once: true });
       this.resolvers.set(decision.id, settle);
@@ -426,7 +530,7 @@ export class ChiefOfStaff {
       // The waiting tool call died with a plugin reload; still reach the worker.
       await this.notifyThreadBestEffort(
         decision.threadId,
-        `Chief of staff, answering your question "${decision.question}": ${answer}`,
+        `Chief of staff, answering your ${this.store.decisionKind(id) === "irreversible" ? "irreversible-action " : ""}question "${decision.question}": ${answer}`,
       );
     }
     await this.refreshBriefing();
@@ -445,7 +549,9 @@ export class ChiefOfStaff {
     } else if (decision.threadId !== null) {
       await this.notifyThreadBestEffort(
         decision.threadId,
-        `Chief of staff: the user dismissed your question "${decision.question}" without an answer. Proceed using your best judgment and note the choice in your final report.`,
+        this.store.decisionKind(id) === "irreversible"
+          ? `Chief of staff: Denis did not approve the irreversible action in "${decision.question}". Do NOT perform it; continue with reversible work and report blocked if nothing else can be done.`
+          : `Chief of staff: the user dismissed your question "${decision.question}" without an answer. Proceed using your best judgment and note the choice in your final report.`,
       );
     }
     await this.refreshBriefing();
@@ -455,13 +561,30 @@ export class ChiefOfStaff {
 
   // ---- worker reports ----
 
-  report(threadId: string, stage: ReportStage, note: string | null): string {
+  report(threadId: string, stage: ReportStage, note: string | null, workflow: WorkflowReport = {}): string {
     const task = this.store.taskByThreadId(threadId);
     if (task === null) {
       return "This thread is not a Chief of Staff worker; the report was ignored.";
     }
     const now = Date.now();
     const trimmed = note?.trim() ?? null;
+    let meta = this.store.getTaskMeta(task.taskId);
+    if (meta !== null && (workflow.runId !== undefined || workflow.status !== undefined)) {
+      meta = this.store.setTaskMeta(task.taskId, {
+        ...(workflow.runId === undefined ? {} : { workflowRunId: workflow.runId }),
+        ...(workflow.status === undefined ? {} : { workflowStatus: workflow.status }),
+      });
+    }
+    if (stage === "done" && meta?.mode === "feature" && !featureDoneAllowed(meta.workflowStatus, meta.deployRequested)) {
+      const needed = meta.deployRequested ? '"delivered"' : '"merged-to-main"';
+      this.store.updateTask(task.taskId, {
+        progressNote: `done rejected: workflow status ${meta.workflowStatus ?? "unknown"}`,
+        progressAt: now,
+      });
+      this.briefSoon();
+      this.publish();
+      return `NOT ACCEPTED: task #${task.taskId} is a feature; it closes only when the ${meta.workflowStatus === null ? "workflow" : "workflow (currently " + JSON.stringify(meta.workflowStatus) + ")"} returns status ${needed}. Pass workflowStatus and workflowRunId with the report, or report "blocked" with the workflow's report.`;
+    }
     switch (stage) {
       case "started":
         this.store.updateTask(task.taskId, { progressNote: trimmed ?? "started", progressAt: now, stalled: 0, nudgeCount: 0 });
@@ -493,7 +616,7 @@ export class ChiefOfStaff {
         void this.commentOnTaskId(task.taskId, `Chief of Staff: worker reported failure — ${trimmed ?? "no detail"}`);
         break;
     }
-    void this.refreshBriefing();
+    this.briefSoon();
     this.publish();
     return `Recorded ${stage} for task #${task.taskId}.`;
   }
@@ -606,7 +729,7 @@ export class ChiefOfStaff {
     }
     // Its questions can no longer be answered through the tool.
     this.dismissStaleDecisionsForTask(task.taskId);
-    void this.refreshBriefing();
+    this.briefSoon();
     this.publish();
   }
 
@@ -764,6 +887,14 @@ export class ChiefOfStaff {
 
   // ---- briefings and overview ----
 
+  /** Fire-and-forget briefing refresh; a late refresh after disposal (closed
+   * database) must never surface as an unhandled rejection. */
+  private briefSoon(): void {
+    this.refreshBriefing().catch((cause: unknown) => {
+      this.bb.log.warn(`briefing: ${cause instanceof Error ? cause.message : String(cause)}`);
+    });
+  }
+
   async refreshBriefing(configured?: boolean): Promise<BriefingRow> {
     const ready = configured ?? (await this.vikunjaConfigured());
     const latest = this.store.latestBriefing();
@@ -823,6 +954,7 @@ export class ChiefOfStaff {
         nudgeCount: task.nudgeCount,
         error: task.error,
         threadStatus,
+        ...this.metaView(task.taskId),
       });
     }
 
@@ -857,6 +989,7 @@ export class ChiefOfStaff {
           autoAnswered: decision.autoAnswered === 1,
           askedAt: decision.askedAt,
           answeredAt: decision.answeredAt,
+          kind: this.store.decisionKind(decision.id),
         };
       }),
       policies: this.store.listPolicies().map((policy) => ({
@@ -865,6 +998,15 @@ export class ChiefOfStaff {
         answer: policy.answer,
         source: policy.source,
       })),
+    };
+  }
+
+  metaView(taskId: number): Pick<TaskView, "mode" | "deployRequested" | "workflowStatus"> {
+    const meta = this.store.getTaskMeta(taskId);
+    return {
+      mode: meta?.mode ?? "task",
+      deployRequested: meta?.deployRequested ?? false,
+      workflowStatus: meta?.workflowStatus ?? null,
     };
   }
 

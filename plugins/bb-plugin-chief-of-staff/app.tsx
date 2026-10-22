@@ -163,6 +163,11 @@ function DecisionCard({
         <p className="min-w-0 truncate text-xs text-muted-foreground">{label}</p>
         <span className="shrink-0 text-xs text-muted-foreground">{formatAge(decision.askedAt, Date.now())}</span>
       </div>
+      {decision.kind === "irreversible" ? (
+        <p className="mt-1 text-xs font-medium text-destructive">
+          Irreversible / high impact — waits for you, never auto-proceeds. Dismiss means no.
+        </p>
+      ) : null}
       <p className="mt-1 text-sm font-medium">{decision.question}</p>
       {decision.context === null ? null : (
         <p className="mt-1 text-xs text-muted-foreground">{decision.context}</p>
@@ -251,6 +256,11 @@ function TaskRowView({
     <li className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-4 py-3 text-sm">
       <StateBadge state={task.state} />
       <span className="font-mono text-xs text-muted-foreground">#{task.taskId}</span>
+      {task.mode === "feature" ? (
+        <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+          feature{task.workflowStatus === null ? "" : ` · ${task.workflowStatus}`}
+        </span>
+      ) : null}
       <span className="min-w-0 flex-1 truncate font-medium" title={task.title}>
         {task.title}
       </span>

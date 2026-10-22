@@ -5,7 +5,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { BUILTIN_POLICIES, parseKeywords } from "./logic";
-import type { BriefingRow, DecisionRow, PolicyRow, TaskRow, TaskState } from "./logic";
+import type { BriefingRow, DecisionKind, DecisionRow, PolicyRow, TaskMeta, TaskMode, TaskRow, TaskState } from "./logic";
 
 export const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS cos_meta (
@@ -82,6 +82,21 @@ export const SCHEMA: string[] = [
      updated_at INTEGER NOT NULL
    )`,
   `CREATE INDEX IF NOT EXISTS cos_tasks_thread ON cos_tasks (thread_id)`,
+  // v0.3: routing facts per task (feature vs plain, deploy request, workflow
+  // run) and the kind of each decision (irreversible ones never time out).
+  `CREATE TABLE IF NOT EXISTS cos_task_meta (
+     task_id INTEGER PRIMARY KEY,
+     mode TEXT NOT NULL DEFAULT 'task',
+     feature TEXT,
+     deploy_requested INTEGER NOT NULL DEFAULT 0,
+     workflow_run_id TEXT,
+     workflow_status TEXT,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS cos_decision_meta (
+     decision_id TEXT PRIMARY KEY,
+     kind TEXT NOT NULL DEFAULT 'routine'
+   )`,
 ];
 
 const BRIEFINGS_KEPT = 20;
@@ -220,21 +235,97 @@ export class ChiefStore {
     this.seedBuiltinPolicies();
   }
 
+  /** Keep the built-in policies in step with BUILTIN_POLICIES: update the
+   * answer of a matching keyword set, insert new ones, drop retired ones.
+   * User policies are never touched. */
   private seedBuiltinPolicies(): void {
-    const count = this.db
-      .prepare<[], { n: number }>("SELECT COUNT(*) AS n FROM cos_policies WHERE source = 'builtin'")
-      .get()!.n;
-    if (count > 0) return;
+    const rows = this.db
+      .prepare<[], { id: string; keywords: string; answer: string }>(
+        "SELECT id, keywords, answer FROM cos_policies WHERE source = 'builtin'",
+      )
+      .all();
+    const byKeywords = new Map(rows.map((row) => [row.keywords, row]));
+    const wanted = new Set<string>();
     const insert = this.db.prepare(
       "INSERT INTO cos_policies (id, keywords, answer, source, created_at) VALUES (?, ?, ?, 'builtin', ?)",
     );
+    const update = this.db.prepare<[string, string]>("UPDATE cos_policies SET answer = ? WHERE id = ?");
+    const remove = this.db.prepare<[string]>("DELETE FROM cos_policies WHERE id = ?");
     const now = Date.now();
-    const seed = this.db.transaction(() => {
-      for (const policy of BUILTIN_POLICIES) {
-        insert.run(randomUUID(), policy.keywords.join(" "), policy.answer, now);
-      }
+    const reconcile = this.db.transaction(() => {
+      BUILTIN_POLICIES.forEach((policy, index) => {
+        const keywords = policy.keywords.join(" ");
+        wanted.add(keywords);
+        const existing = byKeywords.get(keywords);
+        if (existing === undefined) insert.run(randomUUID(), keywords, policy.answer, now + index);
+        else if (existing.answer !== policy.answer) update.run(policy.answer, existing.id);
+      });
+      for (const row of rows) if (!wanted.has(row.keywords)) remove.run(row.id);
     });
-    seed();
+    reconcile();
+  }
+
+  // ---- routing facts per task ----
+
+  getTaskMeta(taskId: number): TaskMeta | null {
+    const record = this.db
+      .prepare<[number], { task_id: number; mode: string; feature: string | null; deploy_requested: number; workflow_run_id: string | null; workflow_status: string | null }>(
+        "SELECT * FROM cos_task_meta WHERE task_id = ?",
+      )
+      .get(taskId);
+    if (record === undefined) return null;
+    return {
+      taskId: record.task_id,
+      mode: (record.mode === "feature" ? "feature" : "task") as TaskMode,
+      feature: record.feature,
+      deployRequested: record.deploy_requested === 1,
+      workflowRunId: record.workflow_run_id,
+      workflowStatus: record.workflow_status,
+    };
+  }
+
+  setTaskMeta(taskId: number, patch: Partial<Omit<TaskMeta, "taskId">>, now = Date.now()): TaskMeta {
+    const current = this.getTaskMeta(taskId) ?? {
+      taskId,
+      mode: "task" as TaskMode,
+      feature: null,
+      deployRequested: false,
+      workflowRunId: null,
+      workflowStatus: null,
+    };
+    const next = { ...current, ...patch };
+    this.db
+      .prepare(
+        `INSERT INTO cos_task_meta (task_id, mode, feature, deploy_requested, workflow_run_id, workflow_status, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(task_id) DO UPDATE SET mode = excluded.mode, feature = excluded.feature,
+           deploy_requested = excluded.deploy_requested, workflow_run_id = excluded.workflow_run_id,
+           workflow_status = excluded.workflow_status, updated_at = excluded.updated_at`,
+      )
+      .run(taskId, next.mode, next.feature, next.deployRequested ? 1 : 0, next.workflowRunId, next.workflowStatus, now);
+    return this.getTaskMeta(taskId)!;
+  }
+
+  /** Active tasks currently driving a feature workflow. */
+  countActiveFeatureTasks(): number {
+    return this.db
+      .prepare<[], { n: number }>(
+        "SELECT COUNT(*) AS n FROM cos_tasks t JOIN cos_task_meta m ON m.task_id = t.task_id WHERE t.state = 'active' AND t.thread_id IS NOT NULL AND m.mode = 'feature'",
+      )
+      .get()!.n;
+  }
+
+  setDecisionKind(decisionId: string, kind: DecisionKind): void {
+    this.db
+      .prepare("INSERT INTO cos_decision_meta (decision_id, kind) VALUES (?, ?) ON CONFLICT(decision_id) DO UPDATE SET kind = excluded.kind")
+      .run(decisionId, kind);
+  }
+
+  decisionKind(decisionId: string): DecisionKind {
+    const record = this.db
+      .prepare<[string], { kind: string }>("SELECT kind FROM cos_decision_meta WHERE decision_id = ?")
+      .get(decisionId);
+    return record?.kind === "irreversible" ? "irreversible" : "routine";
   }
 
   // ---- managed Vikunja tasks ----

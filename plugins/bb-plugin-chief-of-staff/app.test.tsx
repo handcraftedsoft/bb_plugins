@@ -28,6 +28,9 @@ function overviewFixture(overrides: Partial<Overview> = {}): Overview {
         nudgeCount: 0,
         error: null,
         threadStatus: "active",
+        mode: "task",
+        deployRequested: false,
+        workflowStatus: null,
       },
     ],
     decisions: [
@@ -43,6 +46,7 @@ function overviewFixture(overrides: Partial<Overview> = {}): Overview {
         autoAnswered: false,
         askedAt: Date.now(),
         answeredAt: null,
+        kind: "routine",
       },
     ],
     policies: [

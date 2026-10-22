@@ -15,6 +15,8 @@ export interface VikunjaTask {
   projectId: number;
   updated: string;
   assignees: string[];
+  /** Label titles on the task (used to route features to the workflow). */
+  labels: string[];
   /** The bucket holding this task in its kanban view, when expand=buckets returned one. */
   bucketId: number | null;
   bucketTitle: string | null;
@@ -78,7 +80,36 @@ export interface CosSettings {
   stallMinutes: number;
   maxNudges: number;
   pollSeconds: number;
+  /** Hours a ROUTINE question waits before the worker proceeds on its own.
+   * Irreversible decisions never time out. */
   decisionTimeoutHours: number;
+  /** Vikunja label that routes a task through the feature-delivery workflow. */
+  featureLabel: string;
+  /** bb workflow (under .bb/workflows/) that feature tasks run through. */
+  workflowName: string;
+  /** Feature tasks allowed to drive a workflow run at the same time (RAM budget). */
+  maxFeatureRuns: number;
+  /** Provider/model for worker threads ("" = the project's remembered default). */
+  workerProvider: string;
+  featureWorkerModel: string;
+  taskWorkerModel: string;
+  workerReasoning: string;
+}
+
+export type TaskMode = "feature" | "task";
+
+export type DecisionKind = "routine" | "irreversible";
+
+/** Per-task routing facts the chief of staff derives from the Vikunja task. */
+export interface TaskMeta {
+  taskId: number;
+  mode: TaskMode;
+  /** kebab-case feature name for the workflow (feature mode only). */
+  feature: string | null;
+  /** The task text explicitly asks for a push / deploy / release. */
+  deployRequested: boolean;
+  workflowRunId: string | null;
+  workflowStatus: string | null;
 }
 
 /** Realtime channel the backend publishes on after every board change; the
@@ -87,19 +118,24 @@ export const CHANGED_CHANNEL = "chief-of-staff-changed";
 
 export const BUILTIN_POLICIES: Array<Pick<PolicyRow, "keywords" | "answer">> = [
   {
-    keywords: ["branch"],
+    keywords: ["branch", "branches", "worktree", "worktrees"],
     answer:
-      "Create a new branch named for this task (for example work/<short-slug>). Never commit directly to the default branch.",
+      "Feature tasks: the feature-delivery workflow creates and owns every branch and worktree (feature/<name>, feature/<name>-<lane>); never create or switch branches yourself. Plain tasks: commit on the branch of your own bb worktree. Never check out, stash, or edit files in the shared main checkout by hand.",
   },
   {
-    keywords: ["test", "tests", "testing"],
+    keywords: ["merge", "merging", "merged"],
     answer:
-      "Run the repository's existing test suite before finishing, and add or update tests for any behavior you change.",
+      "Merging into LOCAL main is reversible and expected once everything passes. Feature tasks: feature-delivery does the merge. Plain tasks: once make test-<app> and make lint are green, merge with `git -C <main checkout> merge --no-ff <your branch>` where <main checkout> is the first entry of `git worktree list --porcelain` and must be on main; only if the merge touches no locally modified file there, otherwise report blocked. Never force-push or rewrite history.",
+  },
+  {
+    keywords: ["test", "tests", "testing", "lint"],
+    answer:
+      "Run make test-<app> for every area you touched plus make lint; both must be green before you report done. Add or update tests for any behavior you change.",
   },
   {
     keywords: ["commit", "commits"],
     answer:
-      "Commit your work in small, conventional commits on your working branch as you go.",
+      "Commit small, clearly described commits locally as you go. Never commit secrets, never use --no-verify, never rewrite history.",
   },
   {
     keywords: ["dependency", "dependencies", "package", "library", "install"],
@@ -107,7 +143,7 @@ export const BUILTIN_POLICIES: Array<Pick<PolicyRow, "keywords" | "answer">> = [
       "Prefer dependencies already used in this repository. Adding a new runtime dependency needs explicit approval — if you truly need one, ask again and mark it as a decision.",
   },
   {
-    keywords: ["style", "lint", "format", "formatting"],
+    keywords: ["style", "format", "formatting"],
     answer:
       "Follow the repository's existing formatter and linter configuration; match the style of neighboring code.",
   },
@@ -178,6 +214,7 @@ interface RawTask {
   project_id?: unknown;
   updated?: unknown;
   assignees?: unknown;
+  labels?: unknown;
   buckets?: unknown;
 }
 
@@ -191,6 +228,12 @@ function parseOneTask(raw: RawTask): VikunjaTask | null {
         )
         .map((entry) => (typeof entry.username === "string" ? entry.username : ""))
         .filter((username) => username !== "")
+    : [];
+  const labels = Array.isArray(raw.labels)
+    ? raw.labels
+        .filter((entry): entry is { title?: unknown } => typeof entry === "object" && entry !== null)
+        .map((entry) => (typeof entry.title === "string" ? entry.title.trim() : ""))
+        .filter((title) => title !== "")
     : [];
   const bucket = Array.isArray(raw.buckets)
     ? raw.buckets.find(
@@ -206,6 +249,7 @@ function parseOneTask(raw: RawTask): VikunjaTask | null {
     projectId: typeof raw.project_id === "number" ? raw.project_id : 0,
     updated: typeof raw.updated === "string" ? raw.updated : "",
     assignees,
+    labels,
     bucketId: typeof bucket?.id === "number" ? bucket.id : null,
     bucketTitle: typeof bucket?.title === "string" ? bucket.title : null,
     viewId: typeof bucket?.project_view_id === "number" ? bucket.project_view_id : null,
@@ -234,38 +278,200 @@ export function filterByAssignee(tasks: VikunjaTask[], assignee: string): Vikunj
   return tasks.filter((task) => task.assignees.some((name) => name.toLowerCase() === needle));
 }
 
+// ---- routing: feature vs plain task, deploy requests, irreversible questions ----
+
+const FEATURE_LINE = /^\s*feature\s*:\s*([a-z0-9][a-z0-9-]{0,47})\s*$/im;
+
+/** Explicit push / deploy / release requests in the task text. "push
+ * notifications" is a feature, not a push. */
+const DEPLOY_REQUEST =
+  /\b(re-?deploy\w*|deploy\w*|git push|push(?:ed|ing)?\s+(?:it\s+|this\s+|the\s+\w+\s+)?(?:to\s+)?(?:origin|remote|github|upstream)\b|publish\w*|go(?:es|ing)? live|release\s+(?:it\s+|this\s+)?to|(?:to|in|on)\s+prod(?:uction)?\b)/i;
+
+/** Question topics that are irreversible or high impact regardless of task. */
+const IRREVERSIBLE_TOPIC =
+  /\b(delet\w*|remov\w* (?:the |all )?(?:data|users?|records?|accounts?|backups?)|drop(?:ping)?\s+(?:the\s+)?(?:table|database|column|schema)|truncat\w*|wip(?:e|es|ed|ing)\b|destroy\w*|purg\w*|irreversib\w*|destructive|migrat\w*\s+(?:on\s+|the\s+)?(?:prod|production|real|live)|secrets?|credentials?|passwords?|api[- ]?keys?|private[- ]keys?|(?:access|auth|api|bearer|refresh|github|vikunja|personal)\s+tokens?|keystores?|provisioning profiles?|signing (?:keys?|certificates?)|certificates?|pay(?:s|ing|ment|ments)?\b|purchas\w*|billing|invoic\w*|subscription\w*|spend\w*|send (?:an? |the )?(?:e-?mail|message|sms|newsletter|notification)s?|e-?mail (?:the |to )?(?:users|customers|people|denis)|tweet\w*|announc\w*|dns)\b/i;
+
+/** Push / deploy / production topics: allowed only when the task asked for them. */
+const DEPLOY_TOPIC = /\b(re-?deploy\w*|deploy\w*|push\w*|publish\w*|releas\w*|prod|production|go(?:es|ing)? live|app store|play store|testflight)\b/i;
+
+export function slugFeature(title: string): string {
+  return (
+    title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40)
+      .replace(/-+$/g, "") || "feature"
+  );
+}
+
+/** Route a Vikunja task: features (label or a `feature: <name>` line) run
+ * through the workflow; everything else is a plain worker task. */
+export function classifyTask(
+  task: Pick<VikunjaTask, "id" | "title" | "description" | "labels">,
+  featureLabel: string,
+): Omit<TaskMeta, "workflowRunId" | "workflowStatus"> {
+  const text = `${task.title}\n${plainDescription(task.description)}`;
+  const label = featureLabel.trim().toLowerCase();
+  const line = FEATURE_LINE.exec(plainDescription(task.description));
+  const labelled = label !== "" && task.labels.some((entry) => entry.toLowerCase() === label);
+  const feature = line !== null ? line[1]! : labelled ? slugFeature(task.title) : null;
+  return {
+    taskId: task.id,
+    mode: feature === null ? "task" : "feature",
+    feature,
+    deployRequested: DEPLOY_REQUEST.test(text),
+  };
+}
+
+export type QuestionClass = "routine" | "irreversible" | "deploy-allowed";
+
+/** Decide how a worker question is handled. Irreversible questions bypass the
+ * keyword policies and never time out into "best judgment". */
+export function classifyQuestion(question: string, deployRequested: boolean, declared?: DecisionKind): QuestionClass {
+  if (IRREVERSIBLE_TOPIC.test(question)) return "irreversible";
+  if (DEPLOY_TOPIC.test(question)) return deployRequested ? "deploy-allowed" : "irreversible";
+  if (declared === "irreversible") return "irreversible";
+  return "routine";
+}
+
+export const FINISHED_WORKFLOW_STATUSES = ["merged-to-main", "delivered"] as const;
+
+/** Whether a feature task may close: the workflow merged to local main, and
+ * delivered (pushed/deployed) too when the task asked for that. */
+export function featureDoneAllowed(status: string | null, deployRequested: boolean): boolean {
+  if (status === null) return false;
+  if (deployRequested) return status === "delivered";
+  return (FINISHED_WORKFLOW_STATUSES as readonly string[]).includes(status);
+}
+
+export interface WorkerPlan {
+  mode: TaskMode;
+  feature: string | null;
+  deployRequested: boolean;
+  workflowName: string;
+}
+
+function deployRule(plan: WorkerPlan): string {
+  return plan.deployRequested
+    ? "- Push/deploy: this task EXPLICITLY asks for a push/deploy/release, so it is allowed — but only after everything is merged to local main and all tests pass. Push with a plain `git push origin main` (never force) and use the documented deploy procedure for the affected area only."
+    : "- Push/deploy: this task does NOT ask for a push, deploy, or release, so do none of them. If you believe one is needed, ask with chief_of_staff_ask (kind \"irreversible\") and wait.";
+}
+
+const REVERSIBILITY_RULES = [
+  "- Reversible work needs no approval: code, docs, tests, local commits, and merging into LOCAL main once everything passes. Do it without asking.",
+  "- Irreversible or high-impact actions need Denis first: deleting data, destructive migrations on real data, secrets/credential changes, anything paid, external messages (email, chat, social), and anything touching production the task did not ask for. Ask with chief_of_staff_ask (kind \"irreversible\"), wait for the answer, and never proceed without an explicit yes — a dismissed or withdrawn irreversible question means NO.",
+];
+
+/** Rules shared by the first prompt and the hand-off message for adopted threads. */
+export function operatingRules(plan: WorkerPlan): string[] {
+  const common = [
+    ...REVERSIBILITY_RULES,
+    deployRule(plan),
+    '- Report with chief_of_staff_report: "started" when you begin, "progress" with a short note after each meaningful step, "done" only when finished, "failed" if you cannot finish, "blocked" when you cannot proceed.',
+    "- Ask routine questions with chief_of_staff_ask only when genuinely blocked; if a ROUTINE question errors or times out, proceed with your best judgment and note it in your final report.",
+    "- Follow AGENTS.md (repo root and the area you touch). No tm/bd/br task tracker exists here; never push --force, use --no-verify, or rewrite history.",
+  ];
+  if (plan.mode === "feature") {
+    return [
+      `- This is a FEATURE: it ships through the \`${plan.workflowName}\` bb workflow, not by hand. Do not write app code, create branches, merge, or push yourself; the workflow owns spec, build, verify, merge to local main${plan.deployRequested ? ", and delivery (push/deploy)" : ""}.`,
+      ...common,
+      `- "done" is accepted only after the workflow returns status ${plan.deployRequested ? '"delivered"' : '"merged-to-main"'}; pass workflowRunId and workflowStatus in the report.`,
+    ];
+  }
+  return [
+    "- Work in this thread's own bb worktree branch; never edit, stash, or commit in the shared main checkout (the first entry of `git worktree list --porcelain`).",
+    "- When make test-<app> and make lint are green, merge your branch into local main: `git -C <main checkout> merge --no-ff <branch>`, only if that checkout is on main and the merge touches no locally modified file; otherwise report blocked.",
+    ...common,
+  ];
+}
+
+/** The workflow args for a feature task, frozen at dispatch so --resume replays. */
+export function featureArgs(task: Pick<VikunjaTask, "id" | "title" | "description">, meta: Pick<TaskMeta, "feature" | "deployRequested">): Record<string, unknown> {
+  const detail = plainDescription(task.description);
+  return {
+    feature: meta.feature ?? slugFeature(task.title),
+    brief: `${task.title}\n\n${detail === "" ? "(no description — work from the title)" : detail}`.slice(0, 20000),
+    deployRequested: meta.deployRequested,
+    vikunjaTask: task.id,
+  };
+}
+
 /** The prompt a worker thread starts its first turn with. */
-export function buildWorkerPrompt(task: Pick<VikunjaTask, "id" | "title" | "description">): string {
+export function buildWorkerPrompt(
+  task: Pick<VikunjaTask, "id" | "title" | "description">,
+  plan: WorkerPlan = { mode: "task", feature: null, deployRequested: false, workflowName: "feature-delivery" },
+): string {
   const detail = plainDescription(task.description);
   const brief = detail === "" ? "(the task has no description — work from the title)" : detail;
-  return [
+  const header = [
     "You are working one Vikunja task for the user, supervised by the Chief of Staff plugin.",
     "",
     `Task #${task.id}: ${task.title}`,
     "Description:",
     brief,
     "",
+  ];
+  if (plan.mode === "feature") {
+    const argsFile = `/tmp/cos-task-${task.id}-args.json`;
+    const args = JSON.stringify(featureArgs(task, plan));
+    return [
+      ...header,
+      `You are the DRIVER for feature "${plan.feature}". Steps:`,
+      `1. chief_of_staff_report stage "started".`,
+      `2. Freeze the workflow args ONCE (never rewrite this file, even if the Vikunja task is edited later):`,
+      `   cat > ${argsFile} <<'COS_ARGS_EOF'`,
+      `   ${args}`,
+      `   COS_ARGS_EOF`,
+      `3. From this thread's workspace root run: bb workflows run --name ${plan.workflowName} --args "$(cat ${argsFile})"`,
+      `   Report "progress" with the run id (workflowRunId). The workflow notifies this thread when it finishes; check with \`bb workflows status <run-id>\` whenever you are woken or nudged, and report its phase as progress.`,
+      `4. When the run finishes, read its result (bb workflows status <run-id>; the result has status, nextAction, report):`,
+      `   - nextAction "approve": the spec flagged irreversible/high-impact work. Call chief_of_staff_ask with kind "irreversible", the result's approvalReasons and report as context, options ["Approve", "Revise: <notes>", "Cancel"]. Approve → re-run with the SAME args plus "approved": true and --resume <run-id> (write ${argsFile.replace(".json", "-approved.json")} once from the frozen file with approved:true added). Revise → a new run whose brief is the frozen brief plus the notes. Cancel → report "failed" with "cancelled by Denis".`,
+      `   - status "${plan.deployRequested ? "delivered" : "merged-to-main"}": report "done" with workflowRunId and workflowStatus.`,
+      `   - anything else (partial, main-merge-failed, contract-failed, deliver-failed, ...): report "blocked" with the result's report, then chief_of_staff_ask (routine) whether to start a fresh run, hand it to Denis, or cancel.`,
+      "",
+      "Operating rules:",
+      ...operatingRules(plan),
+      "",
+      "Begin now.",
+    ].join("\n");
+  }
+  return [
+    ...header,
     "Operating rules:",
     "- Work autonomously toward a finished result. Make the routine calls yourself (naming, structure, tests, commits) following this repository's conventions.",
-    '- Report with the chief_of_staff_report tool: stage "started" when you begin, "progress" with a short note after each meaningful step, "done" when the task is complete, "failed" if you cannot finish.',
-    "- If you are blocked on a question only the user can answer, call chief_of_staff_ask. It answers immediately when policy covers it; otherwise it waits for the user and may take a long time — only ask when genuinely blocked.",
-    "- If the ask tool errors or times out, proceed with your best judgment and note the decision in your final report.",
-    "- Keep your changes within this project's workspace.",
+    ...operatingRules(plan),
+    "- If the ask tool errors or times out on a routine question, proceed with your best judgment and note the decision in your final report.",
     "",
     "Begin now.",
   ].join("\n");
 }
 
 /** The dynamic instruction block the configure callback injects into worker sessions. */
-export function workerInstructions(taskTitle: string): string {
+export function workerInstructions(taskTitle: string, mode: TaskMode = "task"): string {
   return [
     "You are working a Chief of Staff task:",
     JSON.stringify(taskTitle),
-    "Use chief_of_staff_report to report progress and completion, and chief_of_staff_ask only when blocked on a question you cannot decide. If the ask tool errors or times out, proceed with your best judgment and note it in your final report.",
+    "Use chief_of_staff_report to report progress and completion, and chief_of_staff_ask only when blocked on a question you cannot decide.",
+    'Reversible work (code, docs, tests, local commits, merge to LOCAL main once everything passes) needs no approval. Irreversible or high-impact actions (deleting data, destructive migrations, secrets, paid actions, external messages, production the task did not ask for) need chief_of_staff_ask with kind "irreversible" and an explicit yes — never proceed on a dismissal or timeout.',
+    mode === "feature"
+      ? "This is a feature task: it ships through the feature-delivery workflow; report done only with the workflow's final workflowStatus."
+      : "If a routine question errors or times out, proceed with your best judgment and note it in your final report.",
   ].join("\n");
 }
 
-export function describeAnswer(outcome: "answered" | "dismissed" | "timeout", answer: string): string {
+export function describeAnswer(
+  outcome: "answered" | "dismissed" | "timeout" | "withdrawn",
+  answer: string,
+  kind: DecisionKind = "routine",
+): string {
+  if (kind === "irreversible") {
+    if (outcome === "answered") return `Decision from the user (irreversible action): ${answer}`;
+    return "Denis did not approve this irreversible action (the question was dismissed or withdrawn). Do NOT perform it. Continue with any reversible work and report \"blocked\" if nothing else can be done.";
+  }
+  if (outcome === "withdrawn") {
+    return "The question was withdrawn (thread stopped or the chief of staff restarted). Proceed with your best judgment and note it in your final report.";
+  }
   if (outcome === "answered") return `Decision from the user: ${answer}`;
   if (outcome === "dismissed") {
     return "The user dismissed this question without an answer. Proceed using your best judgment and note the choice in your final report.";

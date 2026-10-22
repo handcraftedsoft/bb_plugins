@@ -18,6 +18,7 @@ interface FakeTask {
   viewId?: number;
   updated?: string;
   project_id?: number;
+  labels?: string[];
 }
 
 function envelope(tasks: FakeTask[]) {
@@ -30,6 +31,7 @@ function envelope(tasks: FakeTask[]) {
       project_id: task.project_id ?? 6,
       updated: task.updated ?? "2026-10-21T10:00:00Z",
       assignees: (task.assignees ?? []).map((username) => ({ id: 5, username })),
+      labels: (task.labels ?? []).map((title, index) => ({ id: index + 1, title })),
       buckets:
         task.bucketId === undefined
           ? []
@@ -159,7 +161,7 @@ test("a task with a live linked thread is reused, not respawned", async () => {
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
     const metadata = harness.inspection.sdk.callsTo("threads.updatePluginMetadata")[0]![0] as Record<string, unknown>;
     expect(metadata.threadId).toBe("thr_existing");
-    expect(metadata.set).toEqual({ itemId: "9" });
+    expect(metadata.set).toEqual({ itemId: "9", mode: "task" });
     const sends = harness.inspection.sdk.callsTo("threads.send");
     expect(sends.some((call) => ((call[0] as { input?: Array<{ text?: string }> }).input?.[0]?.text ?? "").includes("Chief of Staff plugin now manages"))).toBe(true);
     expect(vikunjaCalls.some((call) => call.method === "link")).toBe(false);
@@ -417,6 +419,196 @@ test("the briefing names pending decisions and in-flight tasks", async () => {
     const decision = overview.decisions.find((entry) => entry.status === "pending");
     await harness.behavior.callRpc("decision_answer", { id: decision!.id, answer: "Keep it" });
     expect(await pending).toBe("Decision from the user: Keep it");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("a feature-labelled task spawns a workflow driver on the cheap model with frozen args", async () => {
+  const { harness } = await makeHarness({
+    tasks: [{ id: 21, title: "QR import", description: "Import WG configs from QR", assignees: ["CTO-bot"], labels: ["Feature"], bucketId: 16 }],
+  });
+  try {
+    await syncNow(harness);
+    const args = harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as Record<string, unknown>;
+    expect(args.providerId).toBe("zcode");
+    expect(args.model).toBe("account:zai-individual-coding-plan/GLM-5.3-Flash");
+    expect((args.pluginMetadata as Record<string, unknown>).mode).toBe("feature");
+    const prompt = String(args.prompt);
+    expect(prompt).toContain("bb workflows run --name feature-delivery");
+    expect(prompt).toContain('"feature":"qr-import"');
+    expect(prompt).toContain('"deployRequested":false');
+    expect(prompt).toContain("does NOT ask for a push");
+    const overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.mode).toBe("feature");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("plain tasks spawn an implementer on GLM-5.3 and a 'feature:' line also routes to the workflow", async () => {
+  const { harness } = await makeHarness({
+    tasks: [
+      { id: 22, title: "Fix typo in README", assignees: ["CTO-bot"], bucketId: 16 },
+      { id: 23, title: "Something", description: "feature: landing-hero\nNew hero", assignees: ["CTO-bot"], bucketId: 16 },
+    ],
+  });
+  try {
+    await syncNow(harness);
+    const spawns = harness.inspection.sdk.callsTo("threads.spawn").map((call) => call[0] as Record<string, unknown>);
+    expect(spawns[0]!.model).toBe("account:zai-individual-coding-plan/GLM-5.3");
+    expect(String(spawns[0]!.prompt)).toContain("merge your branch into local main");
+    expect(String(spawns[1]!.prompt)).toContain('"feature":"landing-hero"');
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("only maxFeatureRuns feature tasks drive a workflow at once", async () => {
+  const { harness } = await makeHarness({
+    tasks: [
+      { id: 24, title: "Feature one", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+      { id: 25, title: "Feature two", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+    ],
+  });
+  try {
+    await syncNow(harness);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    const overview = await harness.behavior.callRpc("overview", null);
+    const waiting = overview.tasks.find((entry) => entry.taskId === 25);
+    expect(waiting?.state).toBe("paused");
+    expect(waiting?.error).toContain("feature-delivery slot");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("a feature closes only once the workflow merged to main", async () => {
+  const { harness, vikunjaCalls } = await makeHarness({
+    tasks: [{ id: 26, title: "Gate me", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 }],
+  });
+  try {
+    await syncNow(harness);
+    const early = await harness.behavior.callAgentTool("chief_of_staff_report", { stage: "done", note: "spec written" }, { threadId: "th_w1" });
+    expect(early).toContain("NOT ACCEPTED");
+    let overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.state).toBe("active");
+    const partial = await harness.behavior.callAgentTool(
+      "chief_of_staff_report",
+      { stage: "done", workflowRunId: "run_1", workflowStatus: "partial" },
+      { threadId: "th_w1" },
+    );
+    expect(partial).toContain("NOT ACCEPTED");
+    const ok = await harness.behavior.callAgentTool(
+      "chief_of_staff_report",
+      { stage: "done", workflowRunId: "run_1", workflowStatus: "merged-to-main" },
+      { threadId: "th_w1" },
+    );
+    expect(ok).toContain("Recorded done");
+    overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.state).toBe("closed");
+    expect(overview.tasks[0]!.workflowStatus).toBe("merged-to-main");
+    expect(vikunjaCalls.some((call) => (call.input as { name?: string })?.name === "tasks_update")).toBe(true);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("a feature that asked for a deploy needs workflow status delivered", async () => {
+  const { harness } = await makeHarness({
+    tasks: [{ id: 27, title: "Hero and redeploy prod after completion", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 }],
+  });
+  try {
+    await syncNow(harness);
+    const args = harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as Record<string, unknown>;
+    expect(String(args.prompt)).toContain('"deployRequested":true');
+    const merged = await harness.behavior.callAgentTool(
+      "chief_of_staff_report",
+      { stage: "done", workflowStatus: "merged-to-main" },
+      { threadId: "th_w1" },
+    );
+    expect(merged).toContain("NOT ACCEPTED");
+    const delivered = await harness.behavior.callAgentTool(
+      "chief_of_staff_report",
+      { stage: "done", workflowStatus: "delivered" },
+      { threadId: "th_w1" },
+    );
+    expect(delivered).toContain("Recorded done");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("irreversible questions bypass policy, never time out, and a dismissal means no", async () => {
+  const { harness } = await makeHarness(
+    { tasks: [{ id: 28, title: "Clean the DB", assignees: ["CTO-bot"], bucketId: 16 }] },
+    { decisionTimeoutHours: 1 },
+  );
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    await syncNow(harness);
+    const pending = harness.behavior.callAgentTool(
+      "chief_of_staff_ask",
+      { question: "Should I delete the old test branch data from the production database?" },
+      { threadId: "th_w1" },
+    );
+    await vi.waitFor(async () => {
+      const overview = await harness.behavior.callRpc("overview", null);
+      expect(overview.counts.pendingDecisions).toBe(1);
+    });
+    await vi.advanceTimersByTimeAsync(5 * 60 * 60 * 1000);
+    const overview = await harness.behavior.callRpc("overview", null);
+    const decision = overview.decisions.find((entry) => entry.status === "pending");
+    expect(decision?.kind).toBe("irreversible");
+    await harness.behavior.callRpc("decision_dismiss", { id: decision!.id });
+    expect(await pending).toContain("Do NOT perform it");
+  } finally {
+    vi.useRealTimers();
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("push/deploy questions are allowed only when the task asked for them", async () => {
+  const { harness } = await makeHarness({
+    tasks: [
+      { id: 29, title: "Update landing copy and deploy to production", assignees: ["CTO-bot"], bucketId: 16 },
+      { id: 30, title: "Update landing copy", assignees: ["CTO-bot"], bucketId: 16 },
+    ],
+  });
+  try {
+    await syncNow(harness);
+    const allowed = await harness.behavior.callAgentTool(
+      "chief_of_staff_ask",
+      { question: "Tests are green and main is merged. Should I push and deploy now?" },
+      { threadId: "th_w1" },
+    );
+    expect(allowed).toContain("deploy requested by the task");
+    const pending = harness.behavior.callAgentTool(
+      "chief_of_staff_ask",
+      { question: "Tests are green and main is merged. Should I push and deploy now?" },
+      { threadId: "th_w2" },
+    );
+    await vi.waitFor(async () => {
+      const overview = await harness.behavior.callRpc("overview", null);
+      expect(overview.counts.pendingDecisions).toBe(1);
+    });
+    const overview = await harness.behavior.callRpc("overview", null);
+    const decision = overview.decisions.find((entry) => entry.status === "pending");
+    expect(decision?.kind).toBe("irreversible");
+    await harness.behavior.callRpc("decision_answer", { id: decision!.id, answer: "Yes, push and deploy" });
+    expect(await pending).toContain("Yes, push and deploy");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("built-in policies no longer forbid merging to main and tell plain tasks how to merge", async () => {
+  const { harness } = await makeHarness({ tasks: [] });
+  try {
+    const overview = await harness.behavior.callRpc("overview", null);
+    const answers = overview.policies.filter((policy) => policy.source === "builtin").map((policy) => policy.answer);
+    expect(answers.some((answer) => answer.includes("Never commit directly to the default branch"))).toBe(false);
+    expect(answers.some((answer) => answer.includes("LOCAL main is reversible"))).toBe(true);
   } finally {
     await harness.lifecycle.dispose();
   }
