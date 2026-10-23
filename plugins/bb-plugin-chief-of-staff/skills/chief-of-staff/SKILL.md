@@ -46,7 +46,9 @@ Operating constraints:
   (ZCode GLM-5.3-Flash) only drives the `feature-delivery` bb workflow with
   frozen args, and its `done` is accepted only once the workflow returned
   `merged-to-main` (or `delivered` when the task asked for a deploy). At most
-  `maxFeatureRuns` (default 1) feature runs at once. Other tasks get a plain
+  `maxFeatureRuns` (default 1) feature runs at once; the workflow also enforces
+  one run at a time with a project lock, so a run in phase `Queue` ("queued
+  behind <run id>") is waiting normally and must not be restarted. Other tasks get a plain
   implementer (ZCode GLM-5.3) that merges its worktree branch into local main
   once tests pass.
 - **Reversible vs irreversible:** code, docs, tests, local commits and merging
