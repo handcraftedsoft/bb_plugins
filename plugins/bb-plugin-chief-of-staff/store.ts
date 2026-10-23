@@ -340,13 +340,16 @@ export class ChiefStore {
 
   // ---- managed Vikunja tasks ----
 
+  /** Re-introducing a task (reopened / re-assigned) also resets the
+   *  change baseline, so the first sweep does not nudge the fresh worker
+   *  with a stale "task was updated" message. */
   upsertTask(
     input: { taskId: number; title: string; projectId: number; lastTaskUpdated: string },
     now = Date.now(),
   ): TaskRow {
     this.db
       .prepare(
-        "INSERT INTO cos_tasks (task_id, title, project_id, state, last_task_updated, updated_at) VALUES (?, ?, ?, 'active', ?, ?) ON CONFLICT(task_id) DO UPDATE SET title = excluded.title, project_id = excluded.project_id, updated_at = excluded.updated_at",
+        "INSERT INTO cos_tasks (task_id, title, project_id, state, last_task_updated, updated_at) VALUES (?, ?, ?, 'active', ?, ?) ON CONFLICT(task_id) DO UPDATE SET title = excluded.title, project_id = excluded.project_id, last_task_updated = excluded.last_task_updated, updated_at = excluded.updated_at",
       )
       .run(input.taskId, input.title, input.projectId, input.lastTaskUpdated, now);
     return this.getTask(input.taskId)!;
