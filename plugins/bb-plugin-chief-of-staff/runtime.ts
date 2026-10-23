@@ -17,8 +17,12 @@ import {
   type BoardColumn,
   CHANGED_CHANNEL,
   classifyQuestion,
+  classifyDependencies,
   classifyTask,
   describeAnswer,
+  describeDeps,
+  schedulingDecision,
+  type TaskDeps,
   featureDoneAllowed,
   operatingRules,
   filterByAssignee,
@@ -89,8 +93,29 @@ function gitNames(repo: string): Promise<string[]> {
   });
 }
 
-/** Test seam: where existing branch/worktree names come from. */
-export const runtimeHooks: { gitNames: (repo: string) => Promise<string[]> } = { gitNames };
+/** True when feature/<slug> is merged into main, or main has a `feature: <slug>`
+ * commit (mirrors the feature-delivery lease helper's hard-dependency check). */
+function featureMerged(repo: string, slug: string): Promise<boolean> {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) return Promise.resolve(false);
+  const run = (args: string[]) =>
+    new Promise<{ ok: boolean; out: string }>((resolve) => {
+      execFile("git", ["-C", repo, ...args], { timeout: 10_000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => {
+        resolve({ ok: !error, out: String(stdout ?? "") });
+      });
+    });
+  const branch = `refs/heads/feature/${slug}`;
+  return run(["rev-parse", "--verify", "-q", branch]).then(async (exists) => {
+    if (exists.ok && (await run(["merge-base", "--is-ancestor", branch, "main"])).ok) return true;
+    const log = await run(["log", "main", "--format=%s", "--max-count=2000"]);
+    return log.ok && log.out.split("\n").some((subject) => subject === `feature: ${slug}` || subject.startsWith(`feature: ${slug} `));
+  });
+}
+
+/** Test seams: existing branch/worktree names; whether a feature is merged to main. */
+export const runtimeHooks: {
+  gitNames: (repo: string) => Promise<string[]>;
+  featureMerged: (repo: string, slug: string) => Promise<boolean>;
+} = { gitNames, featureMerged };
 
 export interface TaskView {
   taskId: number;
@@ -110,6 +135,12 @@ export interface TaskView {
   /** Live workflow phase / run status (workflows plugin), feature tasks only. */
   workflowPhase: string | null;
   runStatus: string | null;
+  /** Dependency layers (feature tasks): hard deps, shared resources, soft deps. */
+  dependsOn: string[];
+  resources: string[];
+  softAfter: string[];
+  /** Why a feature task is not started yet (hard dep / resource / cap), else null. */
+  blockReason: string | null;
 }
 
 export interface DecisionView {
@@ -262,6 +293,45 @@ export class ChiefOfStaff {
       }
     }
     return this.store.setTaskMeta(task.id, classifyTask(task, settings.featureLabel, (name) => taken.has(name)));
+  }
+
+  /** Dependency layers for a feature task. Re-read from the task text until
+   * the task is dispatched (the description may gain Depends-on lines), then
+   * frozen with the workflow args. */
+  private depsFor(task: VikunjaTask, meta: TaskMeta): TaskDeps {
+    const row = this.store.getTask(task.id);
+    const stored = this.store.getSchedule(task.id).deps;
+    if (stored !== null && row !== null && row.threadId !== null) return stored;
+    const deps = classifyDependencies(task, meta.feature);
+    if (stored === null || JSON.stringify(stored) !== JSON.stringify(deps)) this.store.setSchedule(task.id, { deps });
+    return deps;
+  }
+
+  /** Whether a hard dependency is merged to main: its CoS task finished, or git says so. */
+  private async dependencyDone(slug: string, repo: string | null): Promise<boolean> {
+    if (this.store.featureTask(slug)?.finished === true) return true;
+    if (repo === null) return false;
+    try {
+      return await runtimeHooks.featureMerged(repo, slug);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Hard deps merged, shared resources free, slot under the cap? Soft deps never block. */
+  private async scheduleFeature(task: VikunjaTask, meta: TaskMeta, settings: CosSettings) {
+    const deps = this.depsFor(task, meta);
+    const repo = deps.dependsOn.length === 0 ? null : await this.projectRepo(settings.project);
+    const done = new Map<string, boolean>();
+    for (const slug of deps.dependsOn) done.set(slug, await this.dependencyDone(slug, repo));
+    const decision = schedulingDecision({
+      deps,
+      active: this.store.activeFeatureRuns().filter((run) => run.taskId !== task.id),
+      maxFeatureRuns: settings.maxFeatureRuns,
+      depDone: (slug) => done.get(slug) === true,
+      taskForFeature: (slug) => this.store.featureTask(slug)?.taskId ?? null,
+    });
+    return { deps, decision };
   }
 
   /** Local checkout of the BB project (default local_path source), if any. */
@@ -522,18 +592,25 @@ export class ChiefOfStaff {
     }
     // No reusable thread: spawn a fresh worker, within the concurrency budget.
     const meta = await this.metaFor(task, settings);
+    let deps: TaskDeps | null = null;
     if (meta.mode === "feature") {
-      const running = this.store.countActiveFeatureTasks();
-      if (running >= settings.maxFeatureRuns) {
+      const scheduled = await this.scheduleFeature(task, meta, settings);
+      deps = scheduled.deps;
+      if (!scheduled.decision.eligible) {
+        const reason = scheduled.decision.reason!;
         this.store.upsertTask(
           { taskId: task.id, title: task.title, projectId: task.projectId, lastTaskUpdated: task.updated },
           now,
         );
-        this.store.updateTask(
-          task.id,
-          { state: "paused", error: `waiting for a feature-delivery slot (${running}/${settings.maxFeatureRuns})` },
-          now,
-        );
+        this.store.updateTask(task.id, { state: "paused", error: reason }, now);
+        // Comment only when the blocking reason changes (not every sweep).
+        if (this.store.getSchedule(task.id).blockReason !== reason) {
+          this.store.setSchedule(task.id, { blockReason: reason });
+          await this.commentOnTask(
+            task,
+            `Chief of Staff: not started yet — ${reason}. Dependency layers: ${describeDeps(deps)} (soft deps never block).`,
+          );
+        }
         return;
       }
     }
@@ -563,6 +640,7 @@ export class ChiefOfStaff {
       { taskId: task.id, title: task.title, projectId: task.projectId, lastTaskUpdated: task.updated },
       now,
     );
+    if (deps !== null) this.store.setSchedule(task.id, { deps, blockReason: null });
     this.store.updateTask(
       task.id,
       {
@@ -582,7 +660,7 @@ export class ChiefOfStaff {
     await this.commentOnTask(
       task,
       meta.mode === "feature"
-        ? `Chief of Staff: dispatched a worker that runs this through the \`${settings.workflowName}\` workflow (feature \`${meta.feature}\`${meta.deployRequested ? ", delivery requested" : ""}).`
+        ? `Chief of Staff: dispatched a worker that runs this through the \`${settings.workflowName}\` workflow (feature \`${meta.feature}\`${meta.deployRequested ? ", delivery requested" : ""}). Dependency layers: ${describeDeps(deps ?? classifyDependencies(task, meta.feature))}.`
         : "Chief of Staff: dispatched a worker thread for this task.",
     );
     this.bb.log.info(`spawned thread ${threadId} for task ${task.id}`);
@@ -1118,6 +1196,16 @@ export class ChiefOfStaff {
         await this.closeTaskLeftVikunja(row, why);
       }
 
+      // Running feature tasks dispatched before dependency layers existed get
+      // theirs recorded first, so this sweep's scheduling sees their resources.
+      for (const task of tasks) {
+        const row = this.store.getTask(task.id);
+        const meta = this.store.getTaskMeta(task.id);
+        if (row?.threadId != null && meta?.mode === "feature" && this.store.getSchedule(task.id).deps === null) {
+          this.depsFor(task, meta);
+        }
+      }
+
       for (const task of tasks) {
         const row = this.store.getTask(task.id);
         if (row === null || row.threadId === null) {
@@ -1362,15 +1450,30 @@ export class ChiefOfStaff {
     };
   }
 
-  metaView(taskId: number): Pick<TaskView, "mode" | "deployRequested" | "workflowStatus" | "workflowPhase" | "runStatus"> {
+  metaView(
+    taskId: number,
+  ): Pick<TaskView, "mode" | "deployRequested" | "workflowStatus" | "workflowPhase" | "runStatus" | "dependsOn" | "resources" | "softAfter" | "blockReason"> {
     const meta = this.store.getTaskMeta(taskId);
+    const schedule = this.store.getSchedule(taskId);
+    const row = this.store.getTask(taskId);
     return {
       mode: meta?.mode ?? "task",
       deployRequested: meta?.deployRequested ?? false,
       workflowStatus: meta?.workflowStatus ?? null,
       workflowPhase: meta?.workflowPhase ?? null,
       runStatus: meta?.runStatus ?? null,
+      dependsOn: schedule.deps?.dependsOn ?? [],
+      resources: schedule.deps?.resources ?? [],
+      softAfter: schedule.deps?.softAfter ?? [],
+      blockReason: row?.state === "paused" ? schedule.blockReason : null,
     };
+  }
+
+  /** Dependency layers for the CLI line of a feature task ("" for plain tasks). */
+  depsLabel(taskId: number): string {
+    if (this.store.getTaskMeta(taskId)?.mode !== "feature") return "";
+    const deps = this.store.getSchedule(taskId).deps;
+    return deps === null ? "" : ` {${describeDeps(deps)}}`;
   }
 
   private liveRunBrief(taskId: number): { workflowPhase: string | null; runStatus: string | null } {

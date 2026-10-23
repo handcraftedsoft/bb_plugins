@@ -153,3 +153,57 @@ test("workflowPhaseFromTimeline picks the running agent's phase, repair when a r
   expect(workflowPhaseFromTimeline({ rows: [] })).toBeNull();
   expect(workflowPhaseFromTimeline(null)).toBeNull();
 });
+
+test("dependency layers: inference and explicit lines", async () => {
+  const { classifyDependencies, describeDeps } = await import("./logic");
+  const android = classifyDependencies({ title: "Android e2e loop", description: "" }, "android-e2e-loop");
+  expect(android.resources).toContain("emulator");
+  expect(android.dependsOn).toEqual([]);
+  const backend = classifyDependencies({ title: "M2-1 Backend scaffold", description: "Postgres + API" }, "backend-scaffold");
+  expect(backend.resources).toEqual([]);
+  expect(backend.dependsOn).toEqual([]);
+  const tunnel = classifyDependencies({ title: "VPN check", description: "Assert that tunnel traffic reaches the peer" }, "vpn-check");
+  expect(tunnel.dependsOn).toEqual(["android-e2e-loop"]);
+  const explicit = classifyDependencies(
+    { title: "Android client for menus", description: "Depends-on: menus-api<br>Resources: none<br>Soft-after: admin-web" },
+    "android-menus",
+  );
+  expect(explicit.dependsOn).toEqual(["menus-api"]);
+  expect(explicit.resources).toEqual([]);
+  expect(explicit.softAfter).toEqual(["admin-web"]);
+  expect(describeDeps(explicit)).toContain("soft: admin-web");
+});
+
+test("scheduling decision: hard > resource > cap; soft never blocks", async () => {
+  const { schedulingDecision } = await import("./logic");
+  const deps = (over: Partial<{ dependsOn: string[]; resources: string[]; softAfter: string[] }>) => ({
+    dependsOn: [],
+    resources: [],
+    softAfter: [],
+    source: { dependsOn: "", resources: "", softAfter: "" },
+    ...over,
+  });
+  const android = [{ taskId: 12, feature: "android-e2e-loop", resources: ["emulator", "android-sdk-gradle"] }];
+  // Backend runs in parallel with the Android run.
+  expect(schedulingDecision({ deps: deps({}), active: android, maxFeatureRuns: 3, depDone: () => false }).eligible).toBe(true);
+  // Same resource serializes.
+  const sameRes = schedulingDecision({ deps: deps({ resources: ["emulator"] }), active: android, maxFeatureRuns: 3, depDone: () => false });
+  expect(sameRes).toMatchObject({ eligible: false, layer: "resource" });
+  expect(sameRes.reason).toContain("#12");
+  // Hard dep blocks until merged.
+  const hard = schedulingDecision({
+    deps: deps({ dependsOn: ["admin-auth"] }),
+    active: [],
+    maxFeatureRuns: 3,
+    depDone: () => false,
+    taskForFeature: () => 31,
+  });
+  expect(hard).toMatchObject({ eligible: false, layer: "hard" });
+  expect(hard.reason).toContain("admin-auth (#31)");
+  expect(schedulingDecision({ deps: deps({ dependsOn: ["admin-auth"] }), active: [], maxFeatureRuns: 3, depDone: () => true }).eligible).toBe(true);
+  // Soft deps never block.
+  expect(schedulingDecision({ deps: deps({ softAfter: ["android-e2e-loop"] }), active: android, maxFeatureRuns: 3, depDone: () => false }).eligible).toBe(true);
+  // Global cap.
+  const full = [1, 2, 3].map((taskId) => ({ taskId, feature: null, resources: [] }));
+  expect(schedulingDecision({ deps: deps({}), active: full, maxFeatureRuns: 3, depDone: () => true })).toMatchObject({ layer: "cap" });
+});

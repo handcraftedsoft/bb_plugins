@@ -5,7 +5,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { BUILTIN_POLICIES, parseKeywords } from "./logic";
-import type { BriefingRow, DecisionKind, DecisionRow, PolicyRow, TaskMeta, TaskMode, TaskRow, TaskState } from "./logic";
+import type { BriefingRow, DecisionKind, DecisionRow, PolicyRow, TaskDeps, TaskMeta, TaskMode, TaskRow, TaskState } from "./logic";
 
 export const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS cos_meta (
@@ -274,6 +274,72 @@ export class ChiefStore {
     if (!columns.has("workflow_phase")) this.db.exec("ALTER TABLE cos_task_meta ADD COLUMN workflow_phase TEXT");
     if (!columns.has("run_status")) this.db.exec("ALTER TABLE cos_task_meta ADD COLUMN run_status TEXT");
     if (!columns.has("phase_at")) this.db.exec("ALTER TABLE cos_task_meta ADD COLUMN phase_at INTEGER");
+    // v0.5: dependency layers (hard / resource / soft) and why a task is waiting.
+    if (!columns.has("deps_json")) this.db.exec("ALTER TABLE cos_task_meta ADD COLUMN deps_json TEXT");
+    if (!columns.has("block_reason")) this.db.exec("ALTER TABLE cos_task_meta ADD COLUMN block_reason TEXT");
+  }
+
+  // ---- scheduling (dependency layers) ----
+
+  getSchedule(taskId: number): { deps: TaskDeps | null; blockReason: string | null } {
+    const record = this.db
+      .prepare<[number], { deps_json: string | null; block_reason: string | null }>(
+        "SELECT deps_json, block_reason FROM cos_task_meta WHERE task_id = ?",
+      )
+      .get(taskId);
+    if (record === undefined) return { deps: null, blockReason: null };
+    let deps: TaskDeps | null = null;
+    if (record.deps_json !== null) {
+      try {
+        deps = JSON.parse(record.deps_json) as TaskDeps;
+      } catch {
+        deps = null;
+      }
+    }
+    return { deps, blockReason: record.block_reason };
+  }
+
+  /** Updates the scheduling columns of an existing meta row (no-op without one). */
+  setSchedule(taskId: number, patch: { deps?: TaskDeps | null; blockReason?: string | null }): void {
+    if (patch.deps !== undefined) {
+      this.db.prepare("UPDATE cos_task_meta SET deps_json = ? WHERE task_id = ?").run(patch.deps === null ? null : JSON.stringify(patch.deps), taskId);
+    }
+    if (patch.blockReason !== undefined) {
+      this.db.prepare("UPDATE cos_task_meta SET block_reason = ? WHERE task_id = ?").run(patch.blockReason, taskId);
+    }
+  }
+
+  /** Feature tasks driving a workflow run now, with their recorded resources. */
+  activeFeatureRuns(): Array<{ taskId: number; feature: string | null; resources: string[] }> {
+    return this.db
+      .prepare<[], { task_id: number; feature: string | null; deps_json: string | null }>(
+        "SELECT t.task_id, m.feature, m.deps_json FROM cos_tasks t JOIN cos_task_meta m ON m.task_id = t.task_id WHERE t.state = 'active' AND t.thread_id IS NOT NULL AND m.mode = 'feature' ORDER BY t.task_id",
+      )
+      .all()
+      .map((row) => {
+        let resources: string[] = [];
+        try {
+          const deps = row.deps_json === null ? null : (JSON.parse(row.deps_json) as TaskDeps);
+          resources = Array.isArray(deps?.resources) ? deps!.resources : [];
+        } catch {
+          resources = [];
+        }
+        return { taskId: row.task_id, feature: row.feature, resources };
+      });
+  }
+
+  /** The newest CoS task that delivers a feature slug, and whether it finished (merged/delivered). */
+  featureTask(slug: string): { taskId: number; finished: boolean } | null {
+    const row = this.db
+      .prepare<[string], { task_id: number; workflow_status: string | null; state: string | null }>(
+        "SELECT m.task_id, m.workflow_status, t.state FROM cos_task_meta m LEFT JOIN cos_tasks t ON t.task_id = m.task_id WHERE m.feature = ? ORDER BY m.task_id DESC LIMIT 1",
+      )
+      .get(slug);
+    if (row === undefined) return null;
+    return {
+      taskId: row.task_id,
+      finished: row.state === "closed" && (row.workflow_status === "merged-to-main" || row.workflow_status === "delivered"),
+    };
   }
 
   // ---- routing facts per task ----

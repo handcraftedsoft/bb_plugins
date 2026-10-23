@@ -30,6 +30,10 @@ const taskViewSchema = z.object({
   workflowStatus: z.string().nullable(),
   workflowPhase: z.string().nullable(),
   runStatus: z.string().nullable(),
+  dependsOn: z.array(z.string()),
+  resources: z.array(z.string()),
+  softAfter: z.array(z.string()),
+  blockReason: z.string().nullable(),
 });
 
 const decisionViewSchema = z.object({
@@ -137,14 +141,14 @@ export type BriefingView = z.infer<typeof briefingViewSchema>;
 const DEFAULTS: CosSettings = {
   project: "proj_jjitzuscx6",
   assignee: "CTO-bot",
-  maxConcurrent: 2,
+  maxConcurrent: 3,
   stallMinutes: 30,
   maxNudges: 2,
   pollSeconds: 60,
   decisionTimeoutHours: 24,
   featureLabel: "feature",
   workflowName: "feature-delivery",
-  maxFeatureRuns: 1,
+  maxFeatureRuns: 3,
   workerProvider: "zcode",
   featureWorkerModel: "account:zai-individual-coding-plan/GLM-5.3-Flash",
   taskWorkerModel: "account:zai-individual-coding-plan/GLM-5.3",
@@ -222,7 +226,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     maxFeatureRuns: {
       type: "number",
-      label: "Feature workflow runs at once (24 GB RAM: keep 1)",
+      label: "Feature workflow runs at once (cap; shared resources such as the emulator serialize separately)",
       default: DEFAULTS.maxFeatureRuns,
       experimental_schema: z.number().int().min(1).max(4),
     },
@@ -493,7 +497,7 @@ export default async function plugin(bb: BbPluginApi) {
               rows
                 .map(
                   (task) =>
-                    `#${task.taskId} (${task.state}${chief.workflowLabel(task.taskId)}) ${task.title}${task.progressNote === null ? "" : ` — ${task.progressNote}`}${task.error === null ? "" : ` [${task.error}]`}`,
+                    `#${task.taskId} (${task.state}${chief.workflowLabel(task.taskId)}) ${task.title}${task.state === "closed" ? "" : chief.depsLabel(task.taskId)}${task.progressNote === null ? "" : ` — ${task.progressNote}`}${task.error === null ? "" : ` [${task.error}]`}`,
                 )
                 .join("\n"),
             );

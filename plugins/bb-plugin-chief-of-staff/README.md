@@ -84,11 +84,26 @@ worker thread:
   Merge between the phase read and the cancel is cancelled.
 - **Feature routing.** Tasks labelled `feature` (or with a `feature: <name>`
   line) are driven through the rateyourfood `feature-delivery` workflow by a
-  cheap driver worker (ZCode GLM-5.3-Flash) with frozen args; one feature run
-  at a time (`maxFeatureRuns`, matching the workflow's own Queue lock, which
-  makes any extra run wait "queued behind <run id>"); `done` only after `merged-to-main` (or
+  cheap driver worker (ZCode GLM-5.3-Flash) with frozen args; `done` only after `merged-to-main` (or
   `delivered` when the task asked for a deploy). Plain tasks get a GLM-5.3
   implementer that merges its branch into local main when tests pass.
+- **Parallel feature runs with dependency layers.** On pickup each feature
+  task is classified (`classifyDependencies` in `logic.ts`, mirroring the
+  workflow's `classifyDeps`) into three layers, shown in `bb chief tasks`, the
+  panel, and Kanban comments:
+  - *hard* (`Depends-on:` line; or inferred: work that asserts tunnel traffic
+    needs `android-e2e-loop`) — the task waits until each dep's CoS task
+    finished (`merged-to-main`/`delivered`) or git shows `feature/<slug>` /
+    a `feature: <slug>` commit on main;
+  - *resource* (`Resources:` line; or inferred: android/mobile/e2e work needs
+    `emulator` + `android-sdk-gradle`; backend/web need none) — serializes
+    only against active runs holding the same resource;
+  - *soft* (`Soft-after:`) — recorded and shown, never blocks.
+  Explicit lines win; inference reads the prose only. Up to `maxFeatureRuns`
+  (default 3) run at once; everything eligible is dispatched each sweep. A
+  blocked task is paused with the reason (one Kanban comment per change of
+  reason); the workflow's own Queue lease (resource-scoped, cap 3, serialized
+  merge into main) is the second line of defence.
 - **Reversible work proceeds, irreversible work waits.** Irreversible or
   high-impact questions bypass the policies, never time out, and a dismissal
   means no. Push/deploy is allowed only when the task explicitly asked for it.

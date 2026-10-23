@@ -23,6 +23,11 @@ and brings you only the decisions that are yours.
   retried once, genuinely stalled tasks are flagged, tasks completed or
   unassigned in Vikunja wrap up on their own, and a concurrency budget keeps
   the spawn burst small.
+- **Parallel features, dependency-aware.** Feature tasks run up to 3 at a
+  time; each is classified into hard deps (wait for merge to main), shared
+  resources (e.g. the Android emulator — serialize only on that), and soft
+  deps (shown, never blocking). Blocked tasks say exactly why, on the board
+  and in `bb chief tasks`.
 - A `bb chief` CLI for everything — `sync`, `tasks`, `pause`/`resume`,
   `decisions`, `answer`, `policy`, `brief` — so agents and scripts can drive
   the same board.

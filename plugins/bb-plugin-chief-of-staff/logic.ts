@@ -748,14 +748,169 @@ export function operatingRules(plan: WorkerPlan): string[] {
   ];
 }
 
+// ---- dependency layers -----------------------------------------------------------
+// Mirrors the rateyourfood feature-delivery `// <dep-classify>` block and
+// .bb/workflows/README.md "Three dependency layers" (keep them in sync):
+//   * hard (Depends-on): sequences work. The task is not dispatched until every
+//     listed feature is merged to main (its CoS task finished, or git shows
+//     feature/<slug> merged / a `feature: <slug>` commit on main).
+//   * resource (Resources): serializes only on a shared resource (the Android
+//     emulator + SDK/Gradle, the iOS simulator) with the active feature runs.
+//   * soft (Soft-after): recorded and shown, never blocks.
+// Explicit `Depends-on:` / `Resources:` / `Soft-after:` lines win. Otherwise:
+// Android/mobile/e2e/emulator/device work needs the emulator; backend,
+// admin-web and landing need nothing; anything asserting tunnel traffic
+// hard-depends on the #12 harness (android-e2e-loop). A client's dependency on
+// the ticket that adds its API cannot be guessed reliably: write Depends-on.
+
+export const TUNNEL_HARNESS = "android-e2e-loop";
+
+export interface TaskDeps {
+  dependsOn: string[];
+  resources: string[];
+  softAfter: string[];
+  /** How each layer was decided ("explicit" line or the inference rule). */
+  source: { dependsOn: string; resources: string; softAfter: string };
+}
+
+function depSlugs(text: string): string[] {
+  return text
+    .replace(/\([^)]*\)/g, " ")
+    .split(/[,;\s]+/)
+    .map((entry) => entry.trim().toLowerCase().replace(/[*_`.]+$/g, ""))
+    .filter((entry) => entry !== "" && entry !== "none" && entry !== "-" && !/^#\d+$/.test(entry) && /^[a-z0-9][a-z0-9-]*$/.test(entry));
+}
+
+function depLine(text: string, key: string): string | null {
+  const match = new RegExp("^[\\s>*_`#-]*" + key + "[*_`]*\\s*:[*_`]*[ \\t]*(.*)$", "im").exec(text);
+  return match === null ? null : match[1]!;
+}
+
+const unique = (values: string[]) => values.filter((value, index) => values.indexOf(value) === index);
+
+/** The three dependency layers of a task (explicit lines first, then conservative inference). */
+const DEP_LINES = /^[\s>*_`#-]*(depends[- ]on|resources|soft[- ]after)[*_`]*\s*:.*$/gim;
+
+export function classifyDependencies(
+  task: Pick<VikunjaTask, "title" | "description">,
+  feature: string | null,
+): TaskDeps {
+  const text = `${task.title}\n\n${plainDescription(task.description)}`;
+  const self = feature ?? "";
+  const source = { dependsOn: "", resources: "", softAfter: "" };
+  // Inference never reads the dependency lines themselves ("Soft-after:
+  // android-e2e-loop" does not make a backend task need the emulator).
+  const prose = text.replace(DEP_LINES, "");
+  let resources: string[];
+  const resourceLine = depLine(text, "resources");
+  if (resourceLine !== null) {
+    resources = depSlugs(resourceLine);
+    source.resources = "explicit Resources line";
+  } else if (/\b(android|ios|mobile|e2e|emulator|simulator|device)\b/i.test(prose)) {
+    resources =
+      /\b(ios|simulator)\b/i.test(prose) && !/\b(android|emulator)\b/i.test(prose)
+        ? ["ios-simulator"]
+        : ["emulator", "android-sdk-gradle", ...(/\bios\b/i.test(prose) ? ["ios-simulator"] : [])];
+    source.resources = "inferred: mobile/e2e work needs the emulator";
+  } else {
+    resources = [];
+    source.resources = "inferred: backend/web work needs no shared resource";
+  }
+  const dependsLine = depLine(text, "depends[- ]on");
+  let dependsOn = dependsLine === null ? [] : depSlugs(dependsLine);
+  source.dependsOn = dependsLine === null ? "inferred: none" : "explicit Depends-on line";
+  if (
+    self !== TUNNEL_HARNESS &&
+    !dependsOn.includes(TUNNEL_HARNESS) &&
+    /\b(assert|verif|prove|check|measur)\w*\b[^.\n]{0,60}\btunnel|\btunnel(?:led)?[- ](traffic|e2e|assert)/i.test(prose)
+  ) {
+    dependsOn = [...dependsOn, TUNNEL_HARNESS];
+    source.dependsOn += " + inferred: asserts tunnel traffic, needs the #12 harness";
+  }
+  const softLine = depLine(text, "soft[- ]after");
+  const softAfter = softLine === null ? [] : depSlugs(softLine);
+  source.softAfter = softLine === null ? "none" : "explicit Soft-after line";
+  return {
+    dependsOn: unique(dependsOn.filter((slug) => slug !== self)),
+    resources: unique(resources),
+    softAfter: unique(softAfter.filter((slug) => slug !== self)),
+    source,
+  };
+}
+
+/** "hard: a, b · resources: emulator · soft: none" */
+export function describeDeps(deps: TaskDeps): string {
+  const list = (values: string[]) => (values.length === 0 ? "none" : values.join(", "));
+  return `hard: ${list(deps.dependsOn)} · resources: ${list(deps.resources)} · soft: ${list(deps.softAfter)}`;
+}
+
+export interface ActiveFeatureRun {
+  taskId: number;
+  feature: string | null;
+  resources: string[];
+}
+
+export interface SchedulingInput {
+  deps: TaskDeps;
+  /** Feature tasks currently driving a workflow run. */
+  active: ActiveFeatureRun[];
+  maxFeatureRuns: number;
+  /** True when the hard dependency is merged to main. */
+  depDone: (slug: string) => boolean;
+  /** The CoS task that delivers a feature slug, when known. */
+  taskForFeature?: (slug: string) => number | null;
+}
+
+export interface SchedulingDecision {
+  eligible: boolean;
+  layer: "hard" | "resource" | "cap" | null;
+  reason: string | null;
+}
+
+/** Whether a feature task may start now: hard deps merged, its shared
+ * resources free, and a feature-run slot under the cap. Soft deps never block. */
+export function schedulingDecision(input: SchedulingInput): SchedulingDecision {
+  const unmet = input.deps.dependsOn.filter((slug) => !input.depDone(slug));
+  if (unmet.length > 0) {
+    const named = unmet.map((slug) => {
+      const id = input.taskForFeature?.(slug) ?? null;
+      return id === null ? slug : `${slug} (#${id})`;
+    });
+    return { eligible: false, layer: "hard", reason: `hard dependency: waiting for ${named.join(", ")} to merge to main` };
+  }
+  for (const resource of input.deps.resources) {
+    const holder = input.active.find((run) => run.resources.includes(resource));
+    if (holder !== undefined) {
+      return {
+        eligible: false,
+        layer: "resource",
+        reason: `resource: ${resource} is in use by #${holder.taskId}${holder.feature === null ? "" : ` (${holder.feature})`}`,
+      };
+    }
+  }
+  if (input.active.length >= input.maxFeatureRuns) {
+    return {
+      eligible: false,
+      layer: "cap",
+      reason: `waiting for a feature-delivery slot (${input.active.length}/${input.maxFeatureRuns})`,
+    };
+  }
+  return { eligible: true, layer: null, reason: null };
+}
+
 /** The workflow args for a feature task, frozen at dispatch so --resume replays. */
 export function featureArgs(task: Pick<VikunjaTask, "id" | "title" | "description">, meta: Pick<TaskMeta, "feature" | "deployRequested">): Record<string, unknown> {
   const detail = plainDescription(task.description);
+  const feature = meta.feature ?? slugFeature(task.title);
+  const deps = classifyDependencies(task, feature);
   return {
-    feature: meta.feature ?? slugFeature(task.title),
+    feature,
     brief: `${task.title}\n\n${detail === "" ? "(no description — work from the title)" : detail}`.slice(0, 20000),
     deployRequested: meta.deployRequested,
     vikunjaTask: task.id,
+    dependsOn: deps.dependsOn,
+    resources: deps.resources,
+    softAfter: deps.softAfter,
   };
 }
 
@@ -786,7 +941,7 @@ export function buildWorkerPrompt(
       `   ${args}`,
       `   COS_ARGS_EOF`,
       `3. From this thread's workspace root run: bb workflows run --name ${plan.workflowName} --args "$(cat ${argsFile})"`,
-      `   Report "progress" with the run id (workflowRunId). The workflow notifies this thread when it finishes; check with \`bb workflows status <run-id>\` whenever you are woken or nudged, and report "progress" with the run's current phase in the phase field (Queue, Spec, Contract, Approval, Build, Verify, Merge, Deliver; "repair" when Verify sent it back to Build) — the kanban card follows it. Phase "Queue" / "queued behind <run id>" means another feature-delivery run holds the project lock: that is normal, keep waiting; never stop, restart or re-run it.`,
+      `   Report "progress" with the run id (workflowRunId). The workflow notifies this thread when it finishes; check with \`bb workflows status <run-id>\` whenever you are woken or nudged, and report "progress" with the run's current phase in the phase field (Queue, Spec, Contract, Approval, Build, Verify, Merge, Deliver; "repair" when Verify sent it back to Build) — the kanban card follows it. Phase "Queue" / "queued behind <run id>" means the run waits for a lease (a shared resource such as the emulator, a free slot under the parallel-run cap, or a hard dependency merging to main): that is normal, keep waiting; never stop, restart or re-run it. Other feature runs may be active at the same time; never touch their worktrees, containers or the emulator.`,
       `4. When the run finishes, read its result (bb workflows status <run-id>; the result has status, nextAction, report):`,
       `   - nextAction "approve": the spec flagged irreversible/high-impact work. Call chief_of_staff_ask with kind "irreversible", the result's approvalReasons and report as context, options ["Approve", "Revise: <notes>", "Cancel"]. Approve → re-run with the SAME args plus "approved": true and --resume <run-id> (write ${argsFile.replace(".json", "-approved.json")} once from the frozen file with approved:true added). Revise → a new run whose brief is the frozen brief plus the notes. Cancel → report "failed" with "cancelled by Denis".`,
       `   - status "${plan.deployRequested ? "delivered" : "merged-to-main"}": report "done" with workflowRunId and workflowStatus.`,

@@ -11,6 +11,8 @@ import { runtimeHooks } from "./runtime";
 /** Existing git branch/worktree names the slug collision check sees. */
 let gitNamesInRepo: string[] = [];
 runtimeHooks.gitNames = async () => gitNamesInRepo;
+let mergedFeatures: string[] = [];
+runtimeHooks.featureMerged = async (_repo, slug) => mergedFeatures.includes(slug);
 
 interface FakeTask {
   id: number;
@@ -560,7 +562,7 @@ test("only maxFeatureRuns feature tasks drive a workflow at once", async () => {
       { id: 24, title: "Feature one", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
       { id: 25, title: "Feature two", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
     ],
-  });
+  }, { maxFeatureRuns: 1 });
   try {
     await syncNow(harness);
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
@@ -1007,7 +1009,7 @@ test("a feature done in Vikunja mid-Build cancels its run, frees the feature slo
     ],
     runs: { th_w1: [{ id: "wfr_64", status: "running", currentPhase: "Build" }] },
   };
-  const { harness, vikunjaCalls, workflowCalls } = await makeHarness(fake);
+  const { harness, vikunjaCalls, workflowCalls } = await makeHarness(fake, { maxFeatureRuns: 1 });
   try {
     await syncNow(harness);
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
@@ -1158,6 +1160,52 @@ test("an idle feature driver whose run is still running is never nudged; a re-sy
     expect(overview.tasks[0]!.stalled).toBe(false);
   } finally {
     vi.useRealTimers();
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("dependency layers: backend runs beside Android, same resource and hard deps wait, soft never blocks", async () => {
+  mergedFeatures = [];
+  const fake: FakeVikunja = {
+    tasks: [
+      { id: 40, title: "Android e2e loop", description: "feature: android-e2e-loop", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+      { id: 41, title: "Backend scaffold", description: "feature: backend-scaffold<br>Soft-after: android-e2e-loop", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+      { id: 42, title: "Android settings screen", description: "feature: android-settings", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+      { id: 43, title: "Admin web", description: "feature: admin-web<br>Depends-on: admin-auth", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+    ],
+  };
+  const { harness, vikunjaCalls } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4 });
+  try {
+    await syncNow(harness);
+    // Android + backend in parallel (soft dep on Android does not block).
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    let overview = await harness.behavior.callRpc("overview", null);
+    const byId = (id: number) => overview.tasks.find((entry) => entry.taskId === id)!;
+    expect(byId(40).state).toBe("active");
+    expect(byId(40).resources).toContain("emulator");
+    expect(byId(41).state).toBe("active");
+    expect(byId(41).softAfter).toEqual(["android-e2e-loop"]);
+    // Second Android task waits on the emulator; admin-web waits on its hard dep.
+    expect(byId(42).state).toBe("paused");
+    expect(byId(42).blockReason).toContain("resource: emulator is in use by #40");
+    expect(byId(43).state).toBe("paused");
+    expect(byId(43).blockReason).toContain("hard dependency: waiting for admin-auth");
+    expect(comments(vikunjaCalls, 43).join("\n")).toContain("hard: admin-auth");
+    expect(comments(vikunjaCalls, 41).join("\n")).toContain("soft: android-e2e-loop");
+    // A re-sweep with the same reason does not comment again.
+    const before = comments(vikunjaCalls, 43).length;
+    await syncNow(harness);
+    expect(comments(vikunjaCalls, 43)).toHaveLength(before);
+    // Once admin-auth is on main, admin-web starts.
+    mergedFeatures = ["admin-auth"];
+    await syncNow(harness);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(3);
+    overview = await harness.behavior.callRpc("overview", null);
+    expect(byId(43).state).toBe("active");
+    expect(byId(43).blockReason).toBeNull();
+    expect(byId(42).state).toBe("paused");
+  } finally {
+    mergedFeatures = [];
     await harness.lifecycle.dispose();
   }
 });
