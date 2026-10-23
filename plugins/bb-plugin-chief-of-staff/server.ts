@@ -337,7 +337,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "chief_of_staff_report",
     description:
-      "Report progress on your task: 'started' when you begin, 'progress' after each meaningful step, 'done' when complete (this closes the Vikunja task), 'failed' if you cannot finish, 'blocked' when you cannot proceed. Feature tasks pass workflowRunId/workflowStatus; their 'done' is accepted only once the workflow returned merged-to-main (or delivered, when the task asked for a deploy).",
+      "Report progress on your task: 'started' when you begin, 'progress' after each meaningful step, 'done' when complete (this closes the Vikunja task), 'failed' if you cannot finish, 'blocked' when you cannot proceed. Feature tasks pass workflowRunId/workflowStatus and the run's current phase; their 'done' is accepted only once the workflow returned merged-to-main (or delivered, when the task asked for a deploy). The phase moves the kanban card: Queue/Spec/Contract/Approval/Build/repair → Doing, Verify/Merge/Deliver → Testing; plain tasks pass phase 'verifying' while running tests/review and 'building' when back to fixing.",
     presentation: {
       label: {
         pending: "Reporting to the chief of staff",
@@ -349,9 +349,10 @@ export default async function plugin(bb: BbPluginApi) {
       note: z.string().max(1000).optional(),
       workflowRunId: z.string().max(200).optional(),
       workflowStatus: z.string().max(80).optional(),
+      phase: z.string().max(40).optional(),
     }),
-    execute({ stage, note, workflowRunId, workflowStatus }, ctx) {
-      return chief.report(ctx.threadId, stage, note ?? null, { runId: workflowRunId, status: workflowStatus });
+    execute({ stage, note, workflowRunId, workflowStatus, phase }, ctx) {
+      return chief.report(ctx.threadId, stage, note ?? null, { runId: workflowRunId, status: workflowStatus, phase });
     },
   });
 

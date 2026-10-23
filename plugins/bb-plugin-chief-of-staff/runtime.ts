@@ -3,11 +3,18 @@
 // the configured project, keeps workers moving, triages their questions, and
 // composes briefings. Vikunja access goes through the vikunja plugin's RPC
 // (call / links / link / buckets / move / status) via bb.sdk.plugins.callRpc.
+import { execFile } from "node:child_process";
 import { z } from "zod";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import {
+  bucketForColumn,
   buildBriefing,
   buildWorkerPrompt,
+  columnForPhase,
+  parseBuckets,
+  phaseFromNote,
+  workflowPhaseFromTimeline,
+  type BoardColumn,
   CHANGED_CHANNEL,
   classifyQuestion,
   classifyTask,
@@ -34,7 +41,38 @@ import { ChiefStore } from "./store";
 const VIKUNJA_PLUGIN_ID = "vikunja";
 const AUTO_RETRIES = 1;
 const MAX_TASK_PAGES = 10;
-const DOING_BUCKET = /^(doing|in progress|wip)$/i;
+const VIEW_CACHE_MS = 10 * 60_000;
+
+/** Branch and worktree names in a local git checkout (feature slug collision
+ * check). Best effort: any failure yields no names. */
+function gitNames(repo: string): Promise<string[]> {
+  const run = (args: string[]) =>
+    new Promise<string>((resolve) => {
+      execFile("git", ["-C", repo, ...args], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
+        resolve(error ? "" : String(stdout));
+      });
+    });
+  return Promise.all([
+    run(["for-each-ref", "--format=%(refname:short)", "refs/heads"]),
+    run(["worktree", "list", "--porcelain"]),
+  ]).then(([branches, worktrees]) => {
+    const names = new Set<string>();
+    for (const branch of branches.split("\n").map((line) => line.trim()).filter(Boolean)) {
+      names.add(branch);
+      const leaf = branch.split("/").pop();
+      if (leaf) names.add(leaf);
+    }
+    for (const line of worktrees.split("\n")) {
+      if (!line.startsWith("worktree ")) continue;
+      const parts = line.slice("worktree ".length).trim().split("/").filter(Boolean);
+      for (const part of parts.slice(-2)) names.add(part);
+    }
+    return [...names];
+  });
+}
+
+/** Test seam: where existing branch/worktree names come from. */
+export const runtimeHooks: { gitNames: (repo: string) => Promise<string[]> } = { gitNames };
 
 export interface TaskView {
   taskId: number;
@@ -102,6 +140,21 @@ export interface AskInput {
 export interface WorkflowReport {
   runId?: string;
   status?: string;
+  /** Workflow phase (feature drivers) or "verifying"/"building" (plain tasks). */
+  phase?: string;
+}
+
+interface KanbanView {
+  id: number;
+  doneBucketId: number | null;
+}
+
+/** Where a card should go and where it was last put. */
+interface CardRef {
+  id: number;
+  projectId: number;
+  bucketId?: number | null;
+  viewId?: number | null;
 }
 
 type AskOutcome = { kind: "answered"; answer: string } | { kind: "dismissed" } | { kind: "withdrawn" | "timeout" };
@@ -111,6 +164,9 @@ export class ChiefOfStaff {
   private wakeDeferred: Promise<void> | null = null;
   private wakeResolve: (() => void) | null = null;
   private sweeping = false;
+  /** Last column the chief of staff moved each task to (avoids re-moving every sweep). */
+  private readonly columns = new Map<number, BoardColumn>();
+  private readonly viewCache = new Map<number, { views: KanbanView[]; at: number }>();
 
   constructor(
     private readonly bb: BbPluginApi,
@@ -168,10 +224,37 @@ export class ChiefOfStaff {
 
   /** Routing facts for a task: derived from the task text on first sight and
    * kept afterwards (the workflow args are frozen at dispatch). */
-  private metaFor(task: VikunjaTask, settings: CosSettings): TaskMeta {
+  private async metaFor(task: VikunjaTask, settings: CosSettings): Promise<TaskMeta> {
     const existing = this.store.getTaskMeta(task.id);
     if (existing !== null) return existing;
-    return this.store.setTaskMeta(task.id, classifyTask(task, settings.featureLabel));
+    const taken = new Set(this.store.listFeatureNames(task.id));
+    const repo = await this.projectRepo(settings.project);
+    if (repo !== null) {
+      try {
+        for (const name of await runtimeHooks.gitNames(repo)) {
+          taken.add(name);
+          const leaf = name.split("/").pop(); // feature/<slug>, bb/<...>
+          if (leaf) taken.add(leaf);
+        }
+      } catch (cause) {
+        this.bb.log.warn(`git names in ${repo}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      }
+    }
+    return this.store.setTaskMeta(task.id, classifyTask(task, settings.featureLabel, (name) => taken.has(name)));
+  }
+
+  /** Local checkout of the BB project (default local_path source), if any. */
+  private async projectRepo(projectId: string): Promise<string | null> {
+    try {
+      const project = (await this.bb.sdk.projects.get({ projectId } as never)) as unknown as {
+        sources?: Array<{ type?: string; path?: string; isDefault?: boolean }>;
+      };
+      const sources = (project?.sources ?? []).filter((source) => source.type === "local_path" && typeof source.path === "string");
+      const chosen = sources.find((source) => source.isDefault) ?? sources[0];
+      return chosen?.path ?? null;
+    } catch {
+      return null;
+    }
   }
 
   private async spawnWorker(task: VikunjaTask, settings: CosSettings, meta: TaskMeta): Promise<string> {
@@ -224,24 +307,82 @@ export class ChiefOfStaff {
     }
   }
 
-  /** Best-effort move of the task to its kanban view's "Doing" bucket. */
-  private async moveTaskToDoing(task: VikunjaTask): Promise<void> {
-    if (task.viewId === null || task.bucketId === null) return;
-    if (task.bucketTitle !== null && DOING_BUCKET.test(task.bucketTitle)) return;
+  /** Kanban views of a Vikunja project (cached), from projects_read. */
+  private async kanbanViews(projectId: number): Promise<KanbanView[]> {
+    const cached = this.viewCache.get(projectId);
+    if (cached !== undefined && Date.now() - cached.at < VIEW_CACHE_MS) return cached.views;
+    const project = await this.vikunja<{ views?: unknown }>("call", { name: "projects_read", arguments: { id: projectId } });
+    const views = (Array.isArray(project?.views) ? project.views : [])
+      .filter((view): view is { id: number; view_kind?: unknown; done_bucket_id?: unknown } =>
+        typeof view === "object" && view !== null && typeof (view as { id?: unknown }).id === "number")
+      .filter((view) => view.view_kind === "kanban" || view.view_kind === 3)
+      .map((view) => ({ id: view.id, doneBucketId: typeof view.done_bucket_id === "number" && view.done_bucket_id > 0 ? view.done_bucket_id : null }));
+    this.viewCache.set(projectId, { views, at: Date.now() });
+    return views;
+  }
+
+  /**
+   * Best-effort move of a task's card to a column in every kanban view of its
+   * project. Buckets are looked up by name per project/view (no hardcoded
+   * ids); Testing falls back to Doing on boards without a testing column.
+   * Never throws; failures are logged.
+   */
+  async moveTaskToColumn(card: CardRef, column: BoardColumn, why: string): Promise<boolean> {
+    if (this.columns.get(card.id) === column) return false;
+    let moved = false;
+    let effective: BoardColumn = column;
     try {
-      const buckets = await this.vikunja<Array<{ id?: unknown; title?: unknown }>>("buckets", {
-        project: task.projectId,
-        view: task.viewId,
-      });
-      const target = Array.isArray(buckets)
-        ? buckets.find((bucket) => typeof bucket.title === "string" && DOING_BUCKET.test(bucket.title))
-        : undefined;
-      if (target === undefined || typeof target.id !== "number") return;
-      await this.vikunja("move", { project: task.projectId, view: task.viewId, bucket: target.id, task: task.id });
+      let views = await this.kanbanViews(card.projectId);
+      if (views.length === 0 && typeof card.viewId === "number") views = [{ id: card.viewId, doneBucketId: null }];
+      if (views.length === 0) {
+        this.bb.log.warn(`move task ${card.id} to ${column}: project ${card.projectId} has no kanban view`);
+        return false;
+      }
+      for (const view of views) {
+        const buckets = parseBuckets(await this.vikunja<unknown>("buckets", { project: card.projectId, view: view.id }));
+        const target = bucketForColumn(buckets, column, view.doneBucketId);
+        if (target === null) {
+          this.bb.log.warn(
+            `move task ${card.id} to ${column}: no matching bucket in project ${card.projectId} view ${view.id} (buckets: ${buckets.map((bucket) => bucket.title).join(", ") || "none"})`,
+          );
+          continue;
+        }
+        effective = target.column;
+        if ((card.viewId === view.id && card.bucketId === target.bucket.id) || this.columns.get(card.id) === target.column) {
+          moved = true;
+          continue;
+        }
+        await this.vikunja("move", { project: card.projectId, view: view.id, bucket: target.bucket.id, task: card.id });
+        moved = true;
+        this.bb.log.info(
+          `moved task ${card.id} to ${target.bucket.title} (project ${card.projectId} view ${view.id}${target.column !== column ? ", no " + column + " column" : ""}; ${why})`,
+        );
+      }
     } catch (cause) {
-      this.bb.log.warn(
-        `move task ${task.id} to Doing: ${cause instanceof Error ? cause.message : String(cause)}`,
-      );
+      this.bb.log.warn(`move task ${card.id} to ${column}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      return false;
+    }
+    if (moved) this.columns.set(card.id, effective);
+    return moved;
+  }
+
+  private async moveTaskToDoing(task: VikunjaTask): Promise<void> {
+    this.columns.delete(task.id); // a fresh dispatch always (re)asserts Doing
+    await this.moveTaskToColumn(task, "doing", "dispatched");
+  }
+
+  /** Feature drivers: follow the workflow run's phase from the driver thread's timeline. */
+  private async syncWorkflowPhase(taskId: number, projectId: number, threadId: string): Promise<void> {
+    let phase: string | null = null;
+    try {
+      const timeline = await this.bb.sdk.threads.timeline({ threadId, deferContent: "true" } as never);
+      phase = workflowPhaseFromTimeline(timeline);
+    } catch {
+      return; // timeline is optional; the driver's phase reports still move the card
+    }
+    const column = columnForPhase(phase);
+    if (column !== null && column !== "done") {
+      await this.moveTaskToColumn({ id: taskId, projectId }, column, `workflow phase ${phase}`);
     }
   }
 
@@ -266,7 +407,7 @@ export class ChiefOfStaff {
 
   /** Adopts a task that already has a linked thread (reuse, never respawn). */
   private async adoptTask(task: VikunjaTask, threadId: string, now: number, settings: CosSettings): Promise<void> {
-    const meta = this.metaFor(task, settings);
+    const meta = await this.metaFor(task, settings);
     // The tools are gated on pluginMetadata.itemId; claim the thread so the
     // next turn constructs its session with chief_of_staff_* available.
     try {
@@ -316,7 +457,7 @@ export class ChiefOfStaff {
       return;
     }
     // No reusable thread: spawn a fresh worker, within the concurrency budget.
-    const meta = this.metaFor(task, settings);
+    const meta = await this.metaFor(task, settings);
     if (meta.mode === "feature") {
       const running = this.store.countActiveFeatureTasks();
       if (running >= settings.maxFeatureRuns) {
@@ -585,6 +726,13 @@ export class ChiefOfStaff {
       this.publish();
       return `NOT ACCEPTED: task #${task.taskId} is a feature; it closes only when the ${meta.workflowStatus === null ? "workflow" : "workflow (currently " + JSON.stringify(meta.workflowStatus) + ")"} returns status ${needed}. Pass workflowStatus and workflowRunId with the report, or report "blocked" with the workflow's report.`;
     }
+    if (stage !== "done") {
+      const phase = workflow.phase ?? (meta?.mode === "feature" ? phaseFromNote(trimmed) : null);
+      const column = columnForPhase(phase);
+      if (column !== null && column !== "done") {
+        void this.moveTaskToColumn({ id: task.taskId, projectId: task.projectId }, column, `reported phase ${phase}`);
+      }
+    }
     switch (stage) {
       case "started":
         this.store.updateTask(task.taskId, { progressNote: trimmed ?? "started", progressAt: now, stalled: 0, nudgeCount: 0 });
@@ -605,7 +753,7 @@ export class ChiefOfStaff {
           error: null,
         });
         this.dismissStaleDecisionsForTask(task.taskId);
-        void this.completeInVikunja(task.taskId, trimmed ?? "reported done");
+        void this.completeInVikunja(task.taskId, task.projectId, trimmed ?? "reported done");
         break;
       case "failed":
         this.store.updateTask(task.taskId, {
@@ -621,10 +769,11 @@ export class ChiefOfStaff {
     return `Recorded ${stage} for task #${task.taskId}.`;
   }
 
-  /** Marks the Vikunja task done (its kanban moves it to the Done bucket). */
-  private async completeInVikunja(taskId: number, note: string): Promise<void> {
+  /** Moves the card to Done (by bucket name, else the view's done bucket) and marks the task done. */
+  private async completeInVikunja(taskId: number, projectId: number, note: string): Promise<void> {
     try {
       await this.vikunja("call", { name: "tasks_update", arguments: { task: taskId, done: true } });
+      await this.moveTaskToColumn({ id: taskId, projectId }, "done", "worker reported done");
       await this.commentOnTaskId(taskId, `Chief of Staff: worker reported done — ${note}`);
     } catch (cause) {
       this.bb.log.warn(
@@ -799,6 +948,10 @@ export class ChiefOfStaff {
             }
           }
         }
+
+        // Feature cards follow the workflow phase (Doing ↔ Testing).
+        const rowMeta = this.store.getTaskMeta(task.id);
+        if (rowMeta?.mode === "feature") await this.syncWorkflowPhase(task.id, task.projectId, row.threadId);
 
         // Keep moving: nudge idle, quiet workers that are not waiting on the user.
         if (this.store.hasPendingDecisionForTask(task.id)) continue;

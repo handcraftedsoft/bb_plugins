@@ -11,6 +11,15 @@ answered from the policy table; everything else becomes a decision the user
 answers in the Chief of Staff panel. Workers move the kanban: dispatch moves
 the card to *Doing* with a comment, a done report closes the task.
 
+Kanban flow (buckets matched by name, case-insensitive, per project/view; no
+hardcoded ids): *Doing* on dispatch and through Queue/Spec/Contract/Approval/
+Build → *Testing* when Verify starts (incl. the Merge checks) → back to
+*Doing* on repair → *Done* when `done` is accepted. A board without a Testing
+column keeps the card in Doing. Workers drive it with the
+`chief_of_staff_report` `phase` field (feature drivers: the workflow phase from
+`bb workflows status`, `repair` when Verify sent it back; plain workers:
+`verifying` / `building`).
+
 Use the `bb chief` CLI to inspect and drive it:
 
 ```sh
@@ -45,7 +54,14 @@ Operating constraints:
   description has a `feature: <kebab-name>` line is a *feature*: its worker
   (ZCode GLM-5.3-Flash) only drives the `feature-delivery` bb workflow with
   frozen args, and its `done` is accepted only once the workflow returned
-  `merged-to-main` (or `delivered` when the task asked for a deploy). At most
+  `merged-to-main` (or `delivered` when the task asked for a deploy). The
+  feature name is the `feature:` line verbatim, else a ≤32-char word-boundary
+  slug of the title (parentheses/filler dropped; `-<task id>` appended on a
+  collision with another task's feature or a git branch/worktree). "Asked for
+  a deploy" means an explicit `Deploy: yes` / `Ship: yes` line or a clear
+  affirmative ("and deploy to prod"); `Deploy: no`, negations and bare
+  mentions ("deploy script", "push notifications") mean NO — write
+  `Deploy: no` / `Deploy: yes` in task descriptions to be unambiguous. At most
   `maxFeatureRuns` (default 1) feature runs at once; the workflow also enforces
   one run at a time with a project lock, so a run in phase `Queue` ("queued
   behind <run id>") is waiting normally and must not be restarted. Other tasks get a plain

@@ -11,9 +11,41 @@ worker thread:
   (`bb vikunja link`) is adopted — its thread gains the chief-of-staff tools
   and a hand-off message. Otherwise a new worker spawns in the configured BB
   project (`proj_jjitzuscx6`, rateyourfood), titled `#<task-id> <title>`.
-- **Kanban write-back.** Dispatch moves the card to its view's *Doing*
-  bucket and leaves a comment; a `done` report closes the task (Vikunja moves
-  it to *Done*) with a final comment; failures are commented too.
+- **Kanban write-back.** The card follows the work through every kanban
+  view of its project (views from `projects_read`, buckets looked up **by
+  name, case-insensitively** — no hardcoded ids; the Vikunja v2 buckets
+  endpoint returns a paginated `{items}` envelope, which is parsed):
+
+  | When | Column (bucket names matched) |
+  |---|---|
+  | dispatch / adopt; Queue, Spec, Contract, Approval, Build | **Doing** (`Doing`, `In progress`, `WIP`, …) |
+  | workflow Verify starts (incl. the Merge checks, Deliver) | **Testing** (`Testing`, `QA`, `Review`, `Verify`, …) |
+  | Verify sends it back (`repair`) | **Doing** |
+  | `done` accepted (merged-to-main, or delivered when a deploy was asked) | **Done** (`Done`, `Finished`, …; else the view's done bucket) + `done: true` |
+
+  A board without a Testing column falls back to Doing. Phase comes from the
+  driver's `chief_of_staff_report` `phase` field (it reads
+  `bb workflows status`), a `phase: <name>` in a feature report note, or —
+  best effort — the driver thread's workflow timeline on each sweep. Plain
+  tasks move to Testing only on a clean signal: a report with phase
+  `verifying` (back to Doing with `building`); otherwise they skip Testing.
+  Moves are logged (and failures warned), never silent. Dispatch leaves a
+  comment, a `done` report a final comment; failures are commented too.
+- **Deploy intent (conservative).** `deployRequested` is NO unless the task
+  explicitly asks: an explicit line `Deploy: yes|no` / `Ship: yes|no`
+  (also `Push:`, `Release:`, `Delivery:`; any explicit *no* wins) beats
+  everything; negations (`do not deploy`, `no deploy`, `without pushing`,
+  `skip the release`, …) mean NO; bare mentions (`deploy script`, `deploy
+  docs`, `push notifications`, `release build`, `was deployed`) don't count;
+  only clear affirmatives (`and deploy to prod`, `push to origin`, `redeploy
+  prod`, `ship it`, an imperative `Deploy the …`) mean YES. Ambiguous → NO.
+- **Feature names.** An explicit `feature: <kebab-name>` line (markdown
+  `**feature:** \`name\`` and HTML `<p>` tolerated) is used verbatim.
+  Otherwise the name is a deterministic slug of the title: parenthesized /
+  bracketed parts and filler words dropped, cut at a word boundary to at most
+  32 chars, no trailing dash; when it collides with another task's feature or
+  an existing git branch/worktree of the project checkout, `-<vikunja id>` is
+  appended.
 - **Routine questions answered by policy.** Workers ask through the
   `chief_of_staff_ask` tool; keyword policies (branches, tests, commits,
   dependencies, formatting — plus your own rules) answer instantly.

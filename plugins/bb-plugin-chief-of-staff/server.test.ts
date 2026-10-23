@@ -6,6 +6,11 @@ import {
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server";
+import { runtimeHooks } from "./runtime";
+
+/** Existing git branch/worktree names the slug collision check sees. */
+let gitNamesInRepo: string[] = [];
+runtimeHooks.gitNames = async () => gitNamesInRepo;
 
 interface FakeTask {
   id: number;
@@ -44,9 +49,38 @@ function envelope(tasks: FakeTask[]) {
   };
 }
 
+interface FakeBoardView {
+  id: number;
+  doneBucketId?: number;
+  buckets: Array<{ id: number; title: string; position?: number }>;
+}
+
 interface FakeVikunja {
   tasks: FakeTask[];
   links?: Record<number, string[]>;
+  /** Kanban views per Vikunja project (default: project 6, view 24, To-Do/Doing/Done). */
+  boards?: Record<number, FakeBoardView[]>;
+  /** Driver thread timeline payload per thread (workflow phase sync). */
+  timelines?: Record<string, unknown>;
+}
+
+const DEFAULT_BOARDS: Record<number, FakeBoardView[]> = {
+  6: [
+    {
+      id: 24,
+      doneBucketId: 18,
+      buckets: [
+        { id: 16, title: "To-Do", position: 100 },
+        { id: 17, title: "Doing", position: 200 },
+        { id: 18, title: "Done", position: 300 },
+      ],
+    },
+  ],
+};
+
+/** Vikunja v2 list endpoints return a paginated envelope, not a bare array. */
+function page<T>(items: T[]) {
+  return { $schema: "/api/v2/schemas/Page.json", items, page: 1, per_page: 50, total: items.length, total_pages: 1 };
 }
 
 async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> = {}) {
@@ -63,17 +97,26 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
           if (args.method === "status") return { configured: true, origin: "https://tasks.example" };
           if (args.method === "links") return fake.links?.[Number(input?.task)] ?? [];
           if (args.method === "link") return [String(input?.thread)];
+          const boards = fake.boards ?? DEFAULT_BOARDS;
           if (args.method === "buckets") {
-            return [
-              { id: 16, title: "To-Do" },
-              { id: 17, title: "Doing" },
-              { id: 18, title: "Done" },
-            ];
+            const view = (boards[Number(input?.project)] ?? []).find((entry) => entry.id === Number(input?.view));
+            if (view === undefined) throw new Error(`no view ${String(input?.view)} in project ${String(input?.project)}`);
+            return page(view.buckets.map((bucket) => ({ position: 0, ...bucket, project_view_id: view.id })));
           }
           if (args.method === "move") return {};
           if (args.method === "call") {
             const name = (input as { name?: string })?.name;
             if (name === "tasks_list") return envelope(fake.tasks);
+            if (name === "projects_read") {
+              const id = Number((input as { arguments?: { id?: number } }).arguments?.id);
+              return {
+                id,
+                views: [
+                  { id: 900 + id, title: "List", view_kind: "list" },
+                  ...(boards[id] ?? []).map((view) => ({ id: view.id, title: "Kanban", view_kind: "kanban", done_bucket_id: view.doneBucketId ?? 0 })),
+                ],
+              };
+            }
             return {};
           }
           throw new Error(`unexpected vikunja rpc: ${args.method}`);
@@ -87,6 +130,14 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
         stop: async () => ({ ok: true }),
         archive: async () => ({}),
         updatePluginMetadata: async () => ({}),
+        timeline: async (args: { threadId: string }) => {
+          const payload = fake.timelines?.[args.threadId];
+          if (payload === undefined) throw new Error("no timeline");
+          return payload;
+        },
+      },
+      projects: {
+        get: async () => ({ id: "proj_jjitzuscx6", sources: [{ type: "local_path", path: "/repo", isDefault: true }] }),
       },
     },
   });
@@ -639,4 +690,184 @@ test("the package imports only public SDK surfaces and allowed vendored UI deps"
 
 afterEach(() => {
   vi.useRealTimers();
+  gitNamesInRepo = [];
+});
+
+// ---------------------------------------------------------------------------
+// Kanban column flow (Doing → Testing → Doing on repair → Done), deploy intent
+// and feature slugs, against a fake Vikunja that returns v2 envelopes.
+
+const PROJECT5_BOARD: Record<number, FakeBoardView[]> = {
+  5: [
+    {
+      id: 20,
+      doneBucketId: 15,
+      buckets: [
+        { id: 13, title: "To-Do", position: 100 },
+        { id: 14, title: "Doing", position: 200 },
+        { id: 22, title: "Testing", position: 250 },
+        { id: 15, title: "Done", position: 300 },
+      ],
+    },
+  ],
+};
+
+function moves(calls: Array<{ method: string; input: unknown }>) {
+  return calls.filter((call) => call.method === "move").map((call) => call.input as Record<string, number>);
+}
+
+function report(harness: Awaited<ReturnType<typeof makeHarness>>["harness"], input: Record<string, unknown>, threadId = "th_w1") {
+  return harness.behavior.callAgentTool("chief_of_staff_report", input, { threadId });
+}
+
+test("dispatch finds the Doing bucket by name from the v2 buckets envelope, even without the task's bucket info", async () => {
+  const { harness, vikunjaCalls } = await makeHarness({
+    tasks: [{ id: 40, title: "No bucket info", assignees: ["CTO-bot"], project_id: 5 }],
+    boards: PROJECT5_BOARD,
+  });
+  try {
+    await syncNow(harness);
+    expect(moves(vikunjaCalls)).toEqual([{ project: 5, view: 20, bucket: 14, task: 40 }]);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("a feature card follows the workflow: Doing, Testing on Verify, Doing on repair, Done when merged", async () => {
+  const { harness, vikunjaCalls } = await makeHarness({
+    tasks: [{ id: 41, title: "Flow me", assignees: ["CTO-bot"], labels: ["feature"], project_id: 5, bucketId: 13, viewId: 20 }],
+    boards: PROJECT5_BOARD,
+  });
+  try {
+    await syncNow(harness);
+    expect(moves(vikunjaCalls).at(-1)).toEqual({ project: 5, view: 20, bucket: 14, task: 41 });
+    await report(harness, { stage: "progress", note: "spec approved", phase: "Build" });
+    await vi.waitFor(() => expect(moves(vikunjaCalls)).toHaveLength(1)); // already in Doing: no re-move
+    await report(harness, { stage: "progress", note: "lanes built", phase: "Verify" });
+    await vi.waitFor(() => expect(moves(vikunjaCalls).at(-1)).toEqual({ project: 5, view: 20, bucket: 22, task: 41 }));
+    await report(harness, { stage: "progress", note: "verify failed, repairing", phase: "repair" });
+    await vi.waitFor(() => expect(moves(vikunjaCalls).at(-1)).toEqual({ project: 5, view: 20, bucket: 14, task: 41 }));
+    await report(harness, { stage: "progress", note: "phase: Merge, checks running" });
+    await vi.waitFor(() => expect(moves(vikunjaCalls).at(-1)).toEqual({ project: 5, view: 20, bucket: 22, task: 41 }));
+    await report(harness, { stage: "done", workflowRunId: "run_9", workflowStatus: "merged-to-main" });
+    await vi.waitFor(() => expect(moves(vikunjaCalls).at(-1)).toEqual({ project: 5, view: 20, bucket: 15, task: 41 }));
+    expect(moves(vikunjaCalls).map((move) => move.bucket)).toEqual([14, 22, 14, 22, 15]);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("bucket names match case-insensitively and a board without Testing falls back to Doing", async () => {
+  const { harness, vikunjaCalls } = await makeHarness({
+    tasks: [{ id: 42, title: "Shouty board", assignees: ["CTO-bot"], labels: ["feature"], project_id: 8 }],
+    boards: {
+      8: [
+        {
+          id: 31,
+          buckets: [
+            { id: 70, title: "BACKLOG", position: 1 },
+            { id: 71, title: "in progress", position: 2 },
+            { id: 72, title: "DONE", position: 3 },
+          ],
+        },
+      ],
+    },
+  });
+  try {
+    await syncNow(harness);
+    expect(moves(vikunjaCalls)).toEqual([{ project: 8, view: 31, bucket: 71, task: 42 }]);
+    await report(harness, { stage: "progress", phase: "Verify" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(moves(vikunjaCalls)).toHaveLength(1); // Testing → Doing fallback; already there
+    await report(harness, { stage: "done", workflowStatus: "merged-to-main" });
+    await vi.waitFor(() => expect(moves(vikunjaCalls).at(-1)).toEqual({ project: 8, view: 31, bucket: 72, task: 42 }));
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("a plain task goes to Testing only on a clean 'verifying' signal", async () => {
+  const { harness, vikunjaCalls } = await makeHarness({
+    tasks: [{ id: 43, title: "Plain fix", assignees: ["CTO-bot"], project_id: 5 }],
+    boards: PROJECT5_BOARD,
+  });
+  try {
+    await syncNow(harness);
+    await report(harness, { stage: "progress", note: "phase: verify (just a note, plain tasks ignore notes)" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(moves(vikunjaCalls).map((move) => move.bucket)).toEqual([14]);
+    await report(harness, { stage: "progress", note: "running the test suite", phase: "verifying" });
+    await vi.waitFor(() => expect(moves(vikunjaCalls).map((move) => move.bucket)).toEqual([14, 22]));
+    await report(harness, { stage: "progress", note: "tests failed, fixing", phase: "building" });
+    await vi.waitFor(() => expect(moves(vikunjaCalls).map((move) => move.bucket)).toEqual([14, 22, 14]));
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("the sweep moves a feature card to Testing when the driver's timeline shows a Verify agent", async () => {
+  const { harness, vikunjaCalls } = await makeHarness({
+    tasks: [{ id: 44, title: "Timeline", assignees: ["CTO-bot"], labels: ["feature"], project_id: 5 }],
+    boards: PROJECT5_BOARD,
+    timelines: {
+      th_w1: {
+        rows: [
+          {
+            workKind: "workflow",
+            workflow: {
+              agents: [
+                { label: "build:android", state: "done", phaseTitle: "Build", startedAt: "2026-10-22T03:00:00Z" },
+                { label: "verify:android", state: "running", phaseTitle: "Verify", startedAt: "2026-10-22T03:10:00Z" },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  });
+  try {
+    await syncNow(harness);
+    await syncNow(harness);
+    await vi.waitFor(() => expect(moves(vikunjaCalls).map((move) => move.bucket)).toEqual([14, 22]));
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("'Deploy: no' and negated or bare deploy mentions never set deployRequested", async () => {
+  const { harness } = await makeHarness({
+    tasks: [
+      {
+        id: 45,
+        title: "Android e2e testing loop (unit, device, real tunnel)",
+        description: "Size: normal\nfeature: android-e2e-loop\nDeploy: no\n\nGoal: deploy the APK to the emulator. Do not deploy the VPS.",
+        assignees: ["CTO-bot"],
+        labels: ["feature"],
+      },
+    ],
+  });
+  try {
+    await syncNow(harness);
+    const prompt = String((harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as Record<string, unknown>).prompt);
+    expect(prompt).toContain('"feature":"android-e2e-loop"');
+    expect(prompt).toContain('"deployRequested":false');
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("label-derived feature names are short slugs and get -<id> on a branch/worktree collision", async () => {
+  gitNamesInRepo = ["main", "feature/android-e2e-testing-loop"];
+  const { harness } = await makeHarness({
+    tasks: [
+      { id: 46, title: "Android e2e testing loop (unit, device, real tunnel)", assignees: ["CTO-bot"], labels: ["feature"] },
+    ],
+  });
+  try {
+    await syncNow(harness);
+    const prompt = String((harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as Record<string, unknown>).prompt);
+    expect(prompt).toContain('"feature":"android-e2e-testing-loop-46"');
+  } finally {
+    await harness.lifecycle.dispose();
+  }
 });

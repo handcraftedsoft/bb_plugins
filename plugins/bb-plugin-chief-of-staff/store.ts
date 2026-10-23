@@ -306,6 +306,16 @@ export class ChiefStore {
     return this.getTaskMeta(taskId)!;
   }
 
+  /** Feature names other tasks already use (slug collision check). */
+  listFeatureNames(exceptTaskId: number): string[] {
+    return this.db
+      .prepare<[number], { feature: string }>(
+        "SELECT feature FROM cos_task_meta WHERE feature IS NOT NULL AND task_id != ?",
+      )
+      .all(exceptTaskId)
+      .map((row) => row.feature);
+  }
+
   /** Active tasks currently driving a feature workflow. */
   countActiveFeatureTasks(): number {
     return this.db

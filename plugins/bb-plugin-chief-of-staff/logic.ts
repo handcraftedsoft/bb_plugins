@@ -280,47 +280,126 @@ export function filterByAssignee(tasks: VikunjaTask[], assignee: string): Vikunj
 
 // ---- routing: feature vs plain task, deploy requests, irreversible questions ----
 
-const FEATURE_LINE = /^\s*feature\s*:\s*([a-z0-9][a-z0-9-]{0,47})\s*$/im;
+/** `feature: <name>` on its own line; tolerates markdown emphasis/backticks
+ * (`**feature:** \`name\``, `- feature: name`). */
+const FEATURE_LINE = /^[\s>*_`#-]*feature[*_`]*\s*[:=][\s*_`]*([a-z0-9][a-z0-9-]{0,47})[\s*_`]*$/im;
 
-/** Explicit push / deploy / release requests in the task text. "push
- * notifications" is a feature, not a push. */
-const DEPLOY_REQUEST =
-  /\b(re-?deploy\w*|deploy\w*|git push|push(?:ed|ing)?\s+(?:it\s+|this\s+|the\s+\w+\s+)?(?:to\s+)?(?:origin|remote|github|upstream)\b|publish\w*|go(?:es|ing)? live|release\s+(?:it\s+|this\s+)?to|(?:to|in|on)\s+prod(?:uction)?\b)/i;
+// ---- deploy intent ------------------------------------------------------------
+// Rules (mirrored in the rateyourfood feature-delivery workflow's
+// `// <deploy-intent>` block; keep the two in sync):
+//   1. An explicit `Deploy: yes|no` / `Ship: yes|no` line wins. Any explicit
+//      "no" beats an explicit "yes" (conflict = ambiguous = NO).
+//   2. A negated mention ("no deploy", "don't deploy", "do not deploy",
+//      "without deploying", "not deploy", "nothing ships", "no push") = NO.
+//   3. Otherwise YES only for an explicit affirmative: "and deploy",
+//      "please deploy", "deploy to prod/staging", "redeploy prod", "ship it",
+//      "push to origin", or an imperative line starting with "Deploy ...".
+//   4. Everything else, including bare mentions ("deploy script",
+//      "deployment docs", "push notifications"), is NO.
+const DEPLOY_VERB = String.raw`(?:re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?|ship(?:s|ped|ping)?|push(?:es|ed|ing)?|releas(?:e|es|ed|ing)|publish(?:es|ed|ing)?)`;
+const DEPLOY_EXPLICIT =
+  /^[\s>*_`#-]*(?:deploy(?:ment)?|ship|push|release|deliver(?:y)?)(?:\s+requested)?[*_`]*\s*[:=]\s*[*_`]*\s*(yes|y|true|on|required|no|n|false|off|none|never|not)\b/gim;
+const DEPLOY_NEGATED = new RegExp(
+  String.raw`\b(?:no|not|never|without|nothing|don'?t|do\s+not|doesn'?t|does\s+not|shouldn'?t|should\s+not|must\s+not|mustn'?t|won'?t|will\s+not|avoid|skip)\b(?:\s+[\w'/-]+){0,3}?\s+${DEPLOY_VERB}\b`,
+  "i",
+);
+const DEPLOY_AFFIRMATIVE: RegExp[] = [
+  /\b(?:and|then|please|also|afterwards?)\s+(?:re-?deploy|deploy|ship|push|release|publish)\b(?!\s+(?:script|docs?|notes?|notifications?)\b)/i,
+  new RegExp(
+    String.raw`\b${DEPLOY_VERB}\s+(?:it\s+|this\s+|them\s+|main\s+|the\s+[\w-]+\s+)?(?:to|on|in)\s+(?:the\s+)?(?:prod(?:uction)?|staging|origin|remote|github|upstream|live|server|vps|app\s+store|play\s+store|testflight)\b`,
+    "i",
+  ),
+  /\b(?:re-?deploy|deploy)\s+(?:the\s+)?(?:prod(?:uction)?|staging|live)\b/i,
+  /\bship\s+it\b/i,
+  /^[\s>*_-]*(?:re-?deploy|deploy|ship)\b(?![\s-]*(?:script|docs?|documentation|pipeline|config\w*|process|keys?|steps?|targets?|guide|notes?|section|files?|logs?|is|was|has|:))/im,
+];
+
+export interface DeployIntent {
+  requested: boolean;
+  reason: string;
+}
+
+/** Whether the task text explicitly asks for a deploy/push/release. Ambiguous = NO. */
+export function deployIntent(text: string): DeployIntent {
+  const source = String(text ?? "");
+  const explicit = [...source.matchAll(DEPLOY_EXPLICIT)].map((match) => match[1]!.toLowerCase());
+  if (explicit.length > 0) {
+    const yes = explicit.some((value) => ["yes", "y", "true", "on", "required"].includes(value));
+    const no = explicit.some((value) => !["yes", "y", "true", "on", "required"].includes(value));
+    if (no) return { requested: false, reason: "explicit Deploy/Ship: no line" };
+    if (yes) return { requested: true, reason: "explicit Deploy/Ship: yes line" };
+  }
+  const plain = source.replace(/[*_`]/g, "").replace(/[’‘]/g, "'");
+  if (DEPLOY_NEGATED.test(plain)) return { requested: false, reason: "negated deploy mention" };
+  if (DEPLOY_AFFIRMATIVE.some((pattern) => pattern.test(plain))) return { requested: true, reason: "explicit deploy request" };
+  return { requested: false, reason: "no explicit deploy request" };
+}
 
 /** Question topics that are irreversible or high impact regardless of task. */
 const IRREVERSIBLE_TOPIC =
   /\b(delet\w*|remov\w* (?:the |all )?(?:data|users?|records?|accounts?|backups?)|drop(?:ping)?\s+(?:the\s+)?(?:table|database|column|schema)|truncat\w*|wip(?:e|es|ed|ing)\b|destroy\w*|purg\w*|irreversib\w*|destructive|migrat\w*\s+(?:on\s+|the\s+)?(?:prod|production|real|live)|secrets?|credentials?|passwords?|api[- ]?keys?|private[- ]keys?|(?:access|auth|api|bearer|refresh|github|vikunja|personal)\s+tokens?|keystores?|provisioning profiles?|signing (?:keys?|certificates?)|certificates?|pay(?:s|ing|ment|ments)?\b|purchas\w*|billing|invoic\w*|subscription\w*|spend\w*|send (?:an? |the )?(?:e-?mail|message|sms|newsletter|notification)s?|e-?mail (?:the |to )?(?:users|customers|people|denis)|tweet\w*|announc\w*|dns)\b/i;
 
-/** Push / deploy / production topics: allowed only when the task asked for them. */
-const DEPLOY_TOPIC = /\b(re-?deploy\w*|deploy\w*|push\w*|publish\w*|releas\w*|prod|production|go(?:es|ing)? live|app store|play store|testflight)\b/i;
+/** Push / deploy / production topics: allowed only when the task asked for
+ * them. Feature nouns are not deploys: "push notifications", "release
+ * build/APK/variant/notes", "deployment docs" stay routine. */
+const DEPLOY_TOPIC =
+  /\b(re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?\b(?!\s+(?:script|docs?|documentation)\b)|push(?:es|ed|ing)?\b(?!\s+(?:notifications?|messages?|tokens?|providers?|services?|payloads?)\b)|publish\w*|releas(?:e|es|ed|ing)\b(?!\s+(?:builds?|variants?|apks?|aabs?|notes|mode|config\w*|signing|types?)\b)|prod|production|go(?:es|ing)? live|app store|play store|testflight)\b/i;
 
-export function slugFeature(title: string): string {
-  return (
-    title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 40)
-      .replace(/-+$/g, "") || "feature"
-  );
+/** Filler dropped from feature slugs derived from a title. */
+const SLUG_FILLER = new Set([
+  "a", "an", "the", "and", "or", "for", "of", "to", "in", "on", "at", "by", "with", "without", "via", "from",
+  "into", "onto", "is", "are", "be", "as", "this", "that", "these", "those", "some", "please", "our", "my", "your", "its", "it",
+]);
+export const FEATURE_SLUG_MAX = 32;
+
+export interface SlugOptions {
+  /** True when the name is already used by a branch, worktree, or another task. */
+  taken?: (name: string) => boolean;
+  /** Vikunja task id appended on a collision (`<slug>-<id>`). */
+  taskId?: number;
+}
+
+/** Deterministic kebab-case feature name from a task title: parenthesized
+ * parts and filler words dropped, cut at a word boundary (≤ 32 chars, no
+ * trailing dash); `-<task id>` appended when the name collides. */
+export function slugFeature(title: string, options: SlugOptions = {}): string {
+  const stripped = title.replace(/\([^)]*\)?|\[[^\]]*\]?|\{[^}]*\}?/g, " ").toLowerCase();
+  const all = stripped.split(/[^a-z0-9]+/).filter((word) => word !== "");
+  const kept = all.filter((word) => !SLUG_FILLER.has(word));
+  const words = kept.length > 0 ? kept : all;
+  let base = "";
+  for (const word of words) {
+    const next = base === "" ? word : `${base}-${word}`;
+    if (next.length > FEATURE_SLUG_MAX) break;
+    base = next;
+  }
+  if (base === "" && words.length > 0) base = words[0]!.slice(0, FEATURE_SLUG_MAX);
+  if (base === "") base = "feature";
+  if (options.taken !== undefined && options.taskId !== undefined && options.taken(base)) {
+    return `${base}-${options.taskId}`;
+  }
+  return base;
 }
 
 /** Route a Vikunja task: features (label or a `feature: <name>` line) run
- * through the workflow; everything else is a plain worker task. */
+ * through the workflow; everything else is a plain worker task. An explicit
+ * `feature:` name is used as-is; a title-derived one avoids collisions. */
 export function classifyTask(
   task: Pick<VikunjaTask, "id" | "title" | "description" | "labels">,
   featureLabel: string,
+  taken?: (name: string) => boolean,
 ): Omit<TaskMeta, "workflowRunId" | "workflowStatus"> {
   const text = `${task.title}\n${plainDescription(task.description)}`;
   const label = featureLabel.trim().toLowerCase();
   const line = FEATURE_LINE.exec(plainDescription(task.description));
   const labelled = label !== "" && task.labels.some((entry) => entry.toLowerCase() === label);
-  const feature = line !== null ? line[1]! : labelled ? slugFeature(task.title) : null;
+  const feature =
+    line !== null ? line[1]! : labelled ? slugFeature(task.title, { taken, taskId: task.id }) : null;
   return {
     taskId: task.id,
     mode: feature === null ? "task" : "feature",
     feature,
-    deployRequested: DEPLOY_REQUEST.test(text),
+    deployRequested: deployIntent(text).requested,
   };
 }
 
@@ -343,6 +422,116 @@ export function featureDoneAllowed(status: string | null, deployRequested: boole
   if (status === null) return false;
   if (deployRequested) return status === "delivered";
   return (FINISHED_WORKFLOW_STATUSES as readonly string[]).includes(status);
+}
+
+// ---- kanban columns ------------------------------------------------------------
+
+/** Board columns the chief of staff moves cards through. */
+export type BoardColumn = "doing" | "testing" | "done";
+
+export interface BucketInfo {
+  id: number;
+  title: string;
+  position: number;
+}
+
+/** Buckets from the vikunja `buckets` RPC: Vikunja's v2 API returns a
+ * paginated envelope ({items, page, total_pages}); older shapes were a bare
+ * array. Accept both, drop malformed entries, sort by position. */
+export function parseBuckets(raw: unknown): BucketInfo[] {
+  const list = Array.isArray(raw)
+    ? raw
+    : typeof raw === "object" && raw !== null && Array.isArray((raw as { items?: unknown }).items)
+      ? ((raw as { items: unknown[] }).items)
+      : [];
+  return list
+    .filter((entry): entry is { id: number; title: string; position?: unknown } =>
+      typeof entry === "object" && entry !== null &&
+      typeof (entry as { id?: unknown }).id === "number" &&
+      typeof (entry as { title?: unknown }).title === "string")
+    .map((entry) => ({ id: entry.id, title: entry.title, position: typeof entry.position === "number" ? entry.position : 0 }))
+    .sort((a, b) => a.position - b.position);
+}
+
+const COLUMN_TITLES: Record<BoardColumn, RegExp> = {
+  doing: /^(doing|in[ -]?progress|wip|working|started)$/i,
+  testing: /^(testing|test|tests|qa|in[ -]?review|review|verify|verifying|verification)$/i,
+  done: /^(done|finished|complete|completed|closed)$/i,
+};
+
+/** The bucket for a column, looked up by name (case-insensitive). Testing
+ * falls back to Doing when a board has no testing column; Done falls back to
+ * the view's configured done bucket. */
+export function bucketForColumn(
+  buckets: BucketInfo[],
+  column: BoardColumn,
+  doneBucketId: number | null = null,
+): { bucket: BucketInfo; column: BoardColumn } | null {
+  const byName = (wanted: BoardColumn) => buckets.find((bucket) => COLUMN_TITLES[wanted].test(bucket.title.trim()));
+  const direct = byName(column);
+  if (direct !== undefined) return { bucket: direct, column };
+  if (column === "testing") {
+    const doing = byName("doing");
+    return doing === undefined ? null : { bucket: doing, column: "doing" };
+  }
+  if (column === "done" && doneBucketId !== null) {
+    const configured = buckets.find((bucket) => bucket.id === doneBucketId);
+    if (configured !== undefined) return { bucket: configured, column: "done" };
+  }
+  return null;
+}
+
+/** Column for a workflow phase or a worker-reported phase. Spec / Contract /
+ * Approval / Build / repair are "doing"; Verify, the Merge checks and Deliver
+ * are "testing". Unknown phases return null (no move). */
+export function columnForPhase(phase: string | null | undefined): BoardColumn | null {
+  const value = String(phase ?? "").trim().toLowerCase();
+  if (value === "") return null;
+  if (/^(verify|verifying|verification|review|reviewing|testing|test|tests|qa|merge|merging|deliver|delivering|delivery)\b/.test(value)) return "testing";
+  if (/^(queue|queued|spec|contract|approval|approve|build|building|repair|repairing|fixing|implement\w*|started|working|doing)\b/.test(value)) return "doing";
+  return null;
+}
+
+const NOTE_PHASE = /\bphase\b\s*[:=]?\s*["'`*]*(queue|spec|contract|approval|build|verify|merge|deliver)\b/i;
+
+/** A workflow phase named in a driver's progress note ("phase: Verify"). */
+export function phaseFromNote(note: string | null | undefined): string | null {
+  const match = NOTE_PHASE.exec(String(note ?? ""));
+  return match === null ? null : match[1]!;
+}
+
+/** Current phase of the latest workflow run found anywhere in a thread
+ * timeline payload (rows with workKind "workflow" carry agents with
+ * phaseTitle/state). Running agents win; otherwise the latest started one. */
+export function workflowPhaseFromTimeline(payload: unknown): string | null {
+  const workflows: Array<{ agents: Array<Record<string, unknown>> }> = [];
+  const seen = new Set<unknown>();
+  const visit = (value: unknown, depth: number) => {
+    if (depth > 12 || typeof value !== "object" || value === null || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const entry of value) visit(entry, depth + 1);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    const workflow = record.workflow as { agents?: unknown } | null | undefined;
+    if ((record.workKind === "workflow" || record.kind === "work") && workflow && Array.isArray(workflow.agents)) {
+      workflows.push({ agents: workflow.agents.filter((agent): agent is Record<string, unknown> => typeof agent === "object" && agent !== null) });
+    }
+    for (const key of Object.keys(record)) visit(record[key], depth + 1);
+  };
+  visit(payload, 0);
+  if (workflows.length === 0) return null;
+  const stamp = (agent: Record<string, unknown>) =>
+    typeof agent.startedAt === "number" ? agent.startedAt : typeof agent.queuedAt === "number" ? agent.queuedAt : 0;
+  const agents = workflows.flatMap((workflow) => workflow.agents).filter((agent) => typeof agent.phaseTitle === "string");
+  if (agents.length === 0) return null;
+  const running = agents.filter((agent) => agent.state === "running").sort((a, b) => stamp(b) - stamp(a));
+  const pick = running[0] ?? [...agents].sort((a, b) => stamp(b) - stamp(a) || Number(b.index ?? 0) - Number(a.index ?? 0))[0]!;
+  const label = typeof pick.label === "string" ? pick.label : "";
+  // Repairs run under the Build phase; verify/review agents under Verify.
+  if (/^repair:/i.test(label)) return "repair";
+  return pick.phaseTitle as string;
 }
 
 export interface WorkerPlan {
@@ -380,6 +569,7 @@ export function operatingRules(plan: WorkerPlan): string[] {
     ];
   }
   return [
+    '- Kanban: report "progress" with phase "verifying" when the change is written and you are running the tests/review, and phase "building" if that sends you back to fixing; the card moves Doing → Testing → Done with it.',
     "- Work in this thread's own bb worktree branch; never edit, stash, or commit in the shared main checkout (the first entry of `git worktree list --porcelain`).",
     "- When make test-<app> and make lint are green, merge your branch into local main: `git -C <main checkout> merge --no-ff <branch>`, only if that checkout is on main and the merge touches no locally modified file; otherwise report blocked.",
     ...common,
@@ -424,7 +614,7 @@ export function buildWorkerPrompt(
       `   ${args}`,
       `   COS_ARGS_EOF`,
       `3. From this thread's workspace root run: bb workflows run --name ${plan.workflowName} --args "$(cat ${argsFile})"`,
-      `   Report "progress" with the run id (workflowRunId). The workflow notifies this thread when it finishes; check with \`bb workflows status <run-id>\` whenever you are woken or nudged, and report its phase as progress. Phase "Queue" / "queued behind <run id>" means another feature-delivery run holds the project lock: that is normal, keep waiting; never stop, restart or re-run it.`,
+      `   Report "progress" with the run id (workflowRunId). The workflow notifies this thread when it finishes; check with \`bb workflows status <run-id>\` whenever you are woken or nudged, and report "progress" with the run's current phase in the phase field (Queue, Spec, Contract, Approval, Build, Verify, Merge, Deliver; "repair" when Verify sent it back to Build) — the kanban card follows it. Phase "Queue" / "queued behind <run id>" means another feature-delivery run holds the project lock: that is normal, keep waiting; never stop, restart or re-run it.`,
       `4. When the run finishes, read its result (bb workflows status <run-id>; the result has status, nextAction, report):`,
       `   - nextAction "approve": the spec flagged irreversible/high-impact work. Call chief_of_staff_ask with kind "irreversible", the result's approvalReasons and report as context, options ["Approve", "Revise: <notes>", "Cancel"]. Approve → re-run with the SAME args plus "approved": true and --resume <run-id> (write ${argsFile.replace(".json", "-approved.json")} once from the frozen file with approved:true added). Revise → a new run whose brief is the frozen brief plus the notes. Cancel → report "failed" with "cancelled by Denis".`,
       `   - status "${plan.deployRequested ? "delivered" : "merged-to-main"}": report "done" with workflowRunId and workflowStatus.`,
