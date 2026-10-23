@@ -258,7 +258,12 @@ function TaskRowView({
       <span className="font-mono text-xs text-muted-foreground">#{task.taskId}</span>
       {task.mode === "feature" ? (
         <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
-          feature{task.workflowStatus === null ? "" : ` · ${task.workflowStatus}`}
+          feature
+          {task.workflowPhase !== null || task.runStatus !== null
+            ? ` · ${[task.runStatus, task.workflowPhase].filter((part) => part !== null).join(" · ")}`
+            : task.workflowStatus === null
+              ? ""
+              : ` · ${task.workflowStatus}`}
         </span>
       ) : null}
       <span className="min-w-0 flex-1 truncate font-medium" title={task.title}>

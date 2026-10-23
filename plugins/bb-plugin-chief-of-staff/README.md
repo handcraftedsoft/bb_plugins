@@ -23,10 +23,17 @@ worker thread:
   | Verify sends it back (`repair`) | **Doing** |
   | `done` accepted (merged-to-main, or delivered when a deploy was asked) | **Done** (`Done`, `Finished`, …; else the view's done bucket) + `done: true` |
 
-  A board without a Testing column falls back to Doing. Phase comes from the
-  driver's `chief_of_staff_report` `phase` field (it reads
-  `bb workflows status`), a `phase: <name>` in a feature report note, or —
-  best effort — the driver thread's workflow timeline on each sweep. Plain
+  A board without a Testing column falls back to Doing. For features the
+  phase is **live**: on every sweep, `bb chief tasks`, the panel overview and
+  the brief, the plugin reads the run from the builtin workflows plugin
+  (`workflowRunView` for the reported run id, else the driver thread's latest
+  run) and stores run id, run status and current phase; the card moves from
+  that, so a driver that reported only at launch is still tracked (nothing
+  restarts or messages the driver). Fallbacks: the driver's
+  `chief_of_staff_report` `phase` field, a `phase: <name>` in a report note,
+  or the driver thread's workflow timeline. An idle driver whose run is
+  queued/running is waiting for the run's notification and is never nudged
+  or flagged stalled. Plain
   tasks move to Testing only on a clean signal: a report with phase
   `verifying` (back to Doing with `building`); otherwise they skip Testing.
   Moves are logged (and failures warned), never silent. Dispatch leaves a
@@ -54,7 +61,27 @@ worker thread:
   worker.
 - **Kept moving.** The monitor nudges idle workers that go quiet, auto-retries
   a failed turn once, flags genuinely stalled tasks, respects the
-  concurrency budget, and notices tasks completed or unassigned in Vikunja.
+  concurrency budget, and closes tasks that leave Vikunja (below).
+- **Done, deleted or unassigned in Vikunja = closed.** Each sweep confirms
+  every tracked task missing from the open list with a direct `id = N` lookup
+  (no rows → deleted; `done` → done; managed user not assigned → unassigned;
+  a failed lookup → retry next sweep, never close on a guess). Whatever the
+  plugin state (active, paused, waiting on a decision), it then cancels the
+  worker's queued/running workflow runs (`workflowStopRun`; a cancelled run's
+  feature-delivery Queue lock and queue entry count as stale, so the next run
+  takes the lock, and the closed row frees the `maxFeatureRuns` slot in the
+  same sweep), dismisses its pending decisions, stops and archives the worker
+  thread (the worktree and branch are kept), and leaves one Vikunja comment
+  (none for a deleted task). Closed rows are never revisited, so repeated
+  sweeps do nothing. **Mid-Merge race:** a run whose current phase is Merge or
+  Deliver is never cancelled (a half-done merge into main is worse than a
+  finished one). The row keeps a `closed in Vikunja; waiting for the
+  in-flight Merge …` marker and a later sweep closes it once the run has
+  left that phase; if the driver reports `done` meanwhile, the row closes
+  without completing the Vikunja task again and the next sweep archives the
+  thread once its last turn is idle. If the task is reopened while waiting,
+  the marker is cleared and work continues. Known window: a run that enters
+  Merge between the phase read and the cancel is cancelled.
 - **Feature routing.** Tasks labelled `feature` (or with a `feature: <name>`
   line) are driven through the rateyourfood `feature-delivery` workflow by a
   cheap driver worker (ZCode GLM-5.3-Flash) with frozen args; one feature run
@@ -65,6 +92,36 @@ worker thread:
 - **Reversible work proceeds, irreversible work waits.** Irreversible or
   high-impact questions bypass the policies, never time out, and a dismissal
   means no. Push/deploy is allowed only when the task explicitly asked for it.
+  Question triage (`triageQuestion` in `logic.ts`) is negation- and
+  context-aware:
+  - The text is split into clauses (sentence punctuation; but / however /
+    unless / except / although / whereas). A mention is ignored when a
+    negation cue (the same list as the deploy rules: no, not, never,
+    without, don't, won't, avoid, skip, …) sits at most three plain words
+    before it in the same clause ("no DNS change", "don't spend", "without
+    touching certs"). Commas, conditions ("if", "whether or not") and words
+    like "forget"/"hesitate"/"sure" break the scope, and a negation never
+    covers another clause, so "No DNS change; should I drop the users
+    table?" still escalates.
+  - Always irreversible: deleting/wiping data and prod migrations,
+    force-push / `push --force` / history rewrites, secrets and
+    credentials, external messages (email/SMS/newsletter/notifications to
+    users, tweets, announcements; a test send to an emulator is routine).
+  - DNS and certificates/keystores/signing: a mutating verb (change, update,
+    add, point, issue, revoke, renew, rotate, generate, upload, …) is
+    irreversible; read-only context (check, inspect, dig, verify, "when does
+    it expire") is routine; local/debug/self-signed/test certs are routine
+    unless production/release is mentioned; anything else is ambiguous and
+    escalates.
+  - Money: pay/buy/purchase/subscribe/upgrade to a paid tier escalate unless
+    the clause is an estimate ("how much would it cost to buy …") with no
+    "should I / and / then" before the verb; "spend time" and code nouns
+    ("purchase flow", "billing page", "paying users") are routine.
+  - Changing production config/env vars/feature flags escalates even when
+    the task asked for a deploy; so do force-push, DNS and cert changes.
+  - Deploy/push/release/production mentions follow the deploy rules
+    (negation-aware; allowed only when the task asked for a deploy); reading
+    production ("check the prod logs") is routine.
 - **Briefings.** A running digest — decisions pending, in flight, stalled,
   completed — in the panel and via `bb chief brief`.
 

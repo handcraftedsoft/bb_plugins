@@ -28,6 +28,8 @@ const taskViewSchema = z.object({
   mode: z.enum(["feature", "task"]),
   deployRequested: z.boolean(),
   workflowStatus: z.string().nullable(),
+  workflowPhase: z.string().nullable(),
+  runStatus: z.string().nullable(),
 });
 
 const decisionViewSchema = z.object({
@@ -477,6 +479,7 @@ export default async function plugin(bb: BbPluginApi) {
             json: { type: "boolean", description: "Emit machine-readable JSON" },
           },
           async run(input) {
+            await chief.refreshLivePhases();
             const rows = store.listTasks();
             if (rows.length === 0) {
               return {
@@ -490,7 +493,7 @@ export default async function plugin(bb: BbPluginApi) {
               rows
                 .map(
                   (task) =>
-                    `#${task.taskId} (${task.state}${chief.metaView(task.taskId).mode === "feature" ? `, feature${chief.metaView(task.taskId).workflowStatus === null ? "" : ` ${chief.metaView(task.taskId).workflowStatus}`}` : ""}) ${task.title}${task.progressNote === null ? "" : ` — ${task.progressNote}`}${task.error === null ? "" : ` [${task.error}]`}`,
+                    `#${task.taskId} (${task.state}${chief.workflowLabel(task.taskId)}) ${task.title}${task.progressNote === null ? "" : ` — ${task.progressNote}`}${task.error === null ? "" : ` [${task.error}]`}`,
                 )
                 .join("\n"),
             );

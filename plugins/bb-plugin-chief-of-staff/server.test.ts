@@ -62,6 +62,16 @@ interface FakeVikunja {
   boards?: Record<number, FakeBoardView[]>;
   /** Driver thread timeline payload per thread (workflow phase sync). */
   timelines?: Record<string, unknown>;
+  /** Workflow runs per origin (driver) thread, served by the fake workflows plugin. */
+  runs?: Record<string, FakeRun[]>;
+  /** Makes the single-task Vikunja lookup (`id = N`) fail. */
+  lookupError?: boolean;
+}
+
+interface FakeRun {
+  id: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  currentPhase: string | null;
 }
 
 const DEFAULT_BOARDS: Record<number, FakeBoardView[]> = {
@@ -86,14 +96,35 @@ function page<T>(items: T[]) {
 async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> = {}) {
   let spawnCount = 0;
   const calls: Array<{ method: string; input: unknown }> = [];
+  const workflowCalls: Array<{ method: string; input: unknown }> = [];
   const { bb, harness } = createFakePluginHost({
     pluginId: "chief-of-staff",
     settings: { project: "proj_jjitzuscx6", assignee: "CTO-bot", ...settings },
     sdk: {
       plugins: {
-        callRpc: async (args: { method: string; input: unknown }) => {
-          calls.push({ method: args.method, input: args.input });
+        callRpc: async (args: { pluginId?: string; method: string; input: unknown }) => {
           const input = args.input as Record<string, unknown> | null;
+          if (args.pluginId === "workflows") {
+            workflowCalls.push({ method: args.method, input: args.input });
+            const runs = fake.runs?.[String(input?.threadId)] ?? [];
+            if (args.method === "workflowActiveRuns") {
+              return { runs: runs.filter((run) => run.status === "queued" || run.status === "running") };
+            }
+            if (args.method === "workflowRunView") {
+              if (input?.runId === null) return { run: runs[runs.length - 1] ?? null };
+              const run = runs.find((entry) => entry.id === input?.runId);
+              if (run === undefined) throw new Error("This workflow run is not available in this thread");
+              return { run };
+            }
+            if (args.method === "workflowStopRun") {
+              const run = runs.find((entry) => entry.id === input?.runId);
+              if (run === undefined) throw new Error("This workflow run is not available in this thread");
+              run.status = "cancelled";
+              return { stopped: true, run };
+            }
+            throw new Error(`unexpected workflows rpc: ${args.method}`);
+          }
+          calls.push({ method: args.method, input: args.input });
           if (args.method === "status") return { configured: true, origin: "https://tasks.example" };
           if (args.method === "links") return fake.links?.[Number(input?.task)] ?? [];
           if (args.method === "link") return [String(input?.thread)];
@@ -106,7 +137,15 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
           if (args.method === "move") return {};
           if (args.method === "call") {
             const name = (input as { name?: string })?.name;
-            if (name === "tasks_list") return envelope(fake.tasks);
+            if (name === "tasks_list") {
+              const filter = String((input as { arguments?: { filter?: string } }).arguments?.filter ?? "");
+              const byId = /^id = (\d+)$/.exec(filter);
+              if (byId !== null) {
+                if (fake.lookupError === true) throw new Error("Vikunja rejected the operation");
+                return envelope(fake.tasks.filter((task) => task.id === Number(byId[1])));
+              }
+              return envelope(filter === "done = false" ? fake.tasks.filter((task) => task.done !== true) : fake.tasks);
+            }
             if (name === "projects_read") {
               const id = Number((input as { arguments?: { id?: number } }).arguments?.id);
               return {
@@ -142,7 +181,7 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
     },
   });
   await plugin(bb);
-  return { harness, vikunjaCalls: calls };
+  return { harness, vikunjaCalls: calls, workflowCalls };
 }
 
 function syncNow(harness: Awaited<ReturnType<typeof makeHarness>>["harness"]) {
@@ -868,6 +907,257 @@ test("label-derived feature names are short slugs and get -<id> on a branch/work
     const prompt = String((harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as Record<string, unknown>).prompt);
     expect(prompt).toContain('"feature":"android-e2e-testing-loop-46"');
   } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Tasks closed in Vikunja (done / deleted / unassigned) close in the plugin,
+// and feature status follows the live workflow run.
+
+function comments(calls: Array<{ method: string; input: unknown }>, task: number) {
+  return calls
+    .filter((call) => call.method === "call" && (call.input as { name?: string })?.name === "task_comments_create")
+    .map((call) => (call.input as { arguments: { task: number; comment: string } }).arguments)
+    .filter((args) => args.task === task)
+    .map((args) => args.comment);
+}
+
+function stops(calls: Array<{ method: string; input: unknown }>) {
+  return calls.filter((call) => call.method === "workflowStopRun").map((call) => (call.input as { runId: string }).runId);
+}
+
+test("a paused task marked done in Vikunja closes: worker stopped and archived, one comment, idempotent", async () => {
+  const fake: FakeVikunja = { tasks: [{ id: 60, title: "Pause me", assignees: ["CTO-bot"], bucketId: 16 }] };
+  const { harness, vikunjaCalls } = await makeHarness(fake);
+  try {
+    await syncNow(harness);
+    await harness.behavior.runCli(["pause", "60"]);
+    fake.tasks[0]!.done = true;
+    const before = comments(vikunjaCalls, 60).length;
+    await syncNow(harness);
+    let overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.state).toBe("closed");
+    expect(overview.tasks[0]!.progressNote).toBe("closed in Vikunja (done)");
+    expect(harness.inspection.sdk.callsTo("threads.archive").map((call) => (call[0] as { threadId: string }).threadId)).toEqual(["th_w1"]);
+    expect(comments(vikunjaCalls, 60).slice(before)).toEqual(["Chief of Staff: closed in Vikunja (done); stopped worker."]);
+    // Repeated sweeps never stop, archive or comment again.
+    await syncNow(harness);
+    await syncNow(harness);
+    expect(harness.inspection.sdk.callsTo("threads.archive")).toHaveLength(1);
+    expect(comments(vikunjaCalls, 60).length - before).toBe(1);
+    overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.counts.closed).toBe(1);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("a deleted task closes without a comment; an unassigned one closes with one", async () => {
+  const fake: FakeVikunja = {
+    tasks: [
+      { id: 61, title: "Delete me", assignees: ["CTO-bot"], bucketId: 16 },
+      { id: 62, title: "Hand me off", assignees: ["CTO-bot"], bucketId: 16 },
+    ],
+  };
+  const { harness, vikunjaCalls } = await makeHarness(fake);
+  try {
+    await syncNow(harness);
+    const before61 = comments(vikunjaCalls, 61).length;
+    const before62 = comments(vikunjaCalls, 62).length;
+    fake.tasks = [{ id: 62, title: "Hand me off", assignees: ["mark"], bucketId: 16 }];
+    await syncNow(harness);
+    const overview = await harness.behavior.callRpc("overview", null);
+    const byId = new Map(overview.tasks.map((task) => [task.taskId, task]));
+    expect(byId.get(61)?.state).toBe("closed");
+    expect(byId.get(61)?.progressNote).toBe("closed in Vikunja (deleted)");
+    expect(byId.get(62)?.state).toBe("closed");
+    expect(byId.get(62)?.progressNote).toBe("closed in Vikunja (unassigned)");
+    expect(comments(vikunjaCalls, 61).length).toBe(before61);
+    expect(comments(vikunjaCalls, 62).slice(before62)).toEqual(["Chief of Staff: closed in Vikunja (unassigned); stopped worker."]);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("a transient Vikunja lookup error never closes a task", async () => {
+  const fake: FakeVikunja = { tasks: [{ id: 63, title: "Flaky", assignees: ["CTO-bot"], bucketId: 16 }], lookupError: true };
+  const { harness } = await makeHarness(fake);
+  try {
+    await syncNow(harness);
+    fake.tasks[0]!.done = true; // gone from the open list, but the confirm lookup fails
+    await syncNow(harness);
+    let overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.state).toBe("active");
+    expect(harness.inspection.sdk.callsTo("threads.archive")).toHaveLength(0);
+    fake.lookupError = false;
+    await syncNow(harness);
+    overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.state).toBe("closed");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("a feature done in Vikunja mid-Build cancels its run, frees the feature slot and closes", async () => {
+  const fake: FakeVikunja = {
+    tasks: [
+      { id: 64, title: "Feature one", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+      { id: 65, title: "Feature two", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+    ],
+    runs: { th_w1: [{ id: "wfr_64", status: "running", currentPhase: "Build" }] },
+  };
+  const { harness, vikunjaCalls, workflowCalls } = await makeHarness(fake);
+  try {
+    await syncNow(harness);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    fake.tasks[0]!.done = true;
+    await syncNow(harness);
+    expect(stops(workflowCalls)).toEqual(["wfr_64"]);
+    expect(fake.runs!.th_w1![0]!.status).toBe("cancelled");
+    const overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks.find((task) => task.taskId === 64)?.state).toBe("closed");
+    expect(comments(vikunjaCalls, 64).at(-1)).toBe("Chief of Staff: closed in Vikunja (done); stopped worker/run (wfr_64).");
+    // The freed slot lets the waiting feature dispatch.
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    await syncNow(harness);
+    expect(stops(workflowCalls)).toEqual(["wfr_64"]);
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("mid-Merge: the run is never cancelled; the task closes once the Merge finished", async () => {
+  const fake: FakeVikunja = {
+    tasks: [{ id: 66, title: "Merging", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 }],
+    runs: { th_w1: [{ id: "wfr_66", status: "running", currentPhase: "Merge" }] },
+  };
+  const { harness, vikunjaCalls, workflowCalls } = await makeHarness(fake);
+  try {
+    await syncNow(harness);
+    fake.tasks[0]!.done = true;
+    await syncNow(harness);
+    await syncNow(harness);
+    expect(stops(workflowCalls)).toEqual([]);
+    expect(harness.inspection.sdk.callsTo("threads.archive")).toHaveLength(0);
+    let overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.state).toBe("active");
+    expect(overview.tasks[0]!.error).toBe("closed in Vikunja; waiting for the in-flight Merge of wfr_66 to finish");
+    // The Merge lands; the driver reports done. No second Vikunja completion, marker kept.
+    fake.runs!.th_w1![0]!.status = "succeeded";
+    const updatesBefore = vikunjaCalls.filter((call) => (call.input as { name?: string })?.name === "tasks_update").length;
+    const ack = await report(harness, { stage: "done", workflowRunId: "wfr_66", workflowStatus: "merged-to-main" });
+    expect(ack).toContain("Recorded done");
+    expect(vikunjaCalls.filter((call) => (call.input as { name?: string })?.name === "tasks_update").length).toBe(updatesBefore);
+    overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.state).toBe("closed");
+    // The next sweep finishes the close: thread archived, one comment, nothing cancelled.
+    await syncNow(harness);
+    await syncNow(harness);
+    expect(stops(workflowCalls)).toEqual([]);
+    expect(harness.inspection.sdk.callsTo("threads.archive")).toHaveLength(1);
+    expect(comments(vikunjaCalls, 66).filter((comment) => comment.includes("closed in Vikunja"))).toEqual([
+      "Chief of Staff: closed in Vikunja (done); stopped worker.",
+    ]);
+    overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.error).toBeNull();
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("mid-Merge without a done report: closes once the run left Merge", async () => {
+  const fake: FakeVikunja = {
+    tasks: [{ id: 67, title: "Merging 2", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 }],
+    runs: { th_w1: [{ id: "wfr_67", status: "running", currentPhase: "Merge" }] },
+  };
+  const { harness, workflowCalls } = await makeHarness(fake);
+  try {
+    await syncNow(harness);
+    fake.tasks[0]!.done = true;
+    await syncNow(harness);
+    expect((await harness.behavior.callRpc("overview", null)).tasks[0]!.state).toBe("active");
+    fake.runs!.th_w1![0]!.status = "succeeded";
+    await syncNow(harness);
+    expect(stops(workflowCalls)).toEqual([]);
+    const overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.state).toBe("closed");
+    expect(overview.tasks[0]!.error).toBeNull();
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("feature status reads the live run phase: CLI, brief and Testing on Verify", async () => {
+  const fake: FakeVikunja = {
+    tasks: [{ id: 68, title: "Live phase", assignees: ["CTO-bot"], labels: ["feature"], project_id: 5 }],
+    boards: PROJECT5_BOARD,
+    runs: { th_w1: [{ id: "wfr_68", status: "queued", currentPhase: "Queue" }] },
+  };
+  const { harness, vikunjaCalls } = await makeHarness(fake);
+  try {
+    await syncNow(harness);
+    // The driver reported only at launch.
+    await report(harness, { stage: "progress", note: "launched", workflowRunId: "wfr_68", workflowStatus: "queued" });
+    fake.runs!.th_w1![0]!.status = "running";
+    fake.runs!.th_w1![0]!.currentPhase = "Build";
+    let listing = await harness.behavior.runCli(["tasks"]);
+    expect(listing.stdout).toContain("#68 (active, feature running, phase Build)");
+    const overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.workflowPhase).toBe("Build");
+    expect(overview.tasks[0]!.runStatus).toBe("running");
+    const brief = await harness.behavior.runCli(["brief", "--refresh"]);
+    expect(brief.stdout).toContain("workflow running, phase Build");
+    fake.runs!.th_w1![0]!.currentPhase = "Verify";
+    await syncNow(harness);
+    await vi.waitFor(() => expect(moves(vikunjaCalls).map((move) => move.bucket).at(-1)).toBe(22));
+    listing = await harness.behavior.runCli(["tasks"]);
+    expect(listing.stdout).toContain("phase Verify");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("a reported run id from another thread falls back to the driver thread's latest run", async () => {
+  const fake: FakeVikunja = {
+    tasks: [{ id: 69, title: "Adopted run", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 }],
+    runs: { th_w1: [{ id: "wfr_real", status: "running", currentPhase: "Spec" }] },
+  };
+  const { harness } = await makeHarness(fake);
+  try {
+    await syncNow(harness);
+    await report(harness, { stage: "progress", workflowRunId: "wfr_elsewhere", workflowStatus: "queued" });
+    const listing = await harness.behavior.runCli(["tasks"]);
+    expect(listing.stdout).toContain("feature running, phase Spec");
+    const overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.workflowPhase).toBe("Spec");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("an idle feature driver whose run is still running is never nudged; a re-sync never re-dispatches or sends 'updated'", async () => {
+  const fake: FakeVikunja = {
+    tasks: [{ id: 70, title: "Long build", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 }],
+    runs: { th_w1: [{ id: "wfr_70", status: "running", currentPhase: "Build" }] },
+  };
+  const { harness, workflowCalls } = await makeHarness(fake);
+  vi.useFakeTimers();
+  try {
+    await syncNow(harness);
+    const sendsAfterDispatch = harness.inspection.sdk.callsTo("threads.send").length;
+    for (let i = 0; i < 3; i += 1) {
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      await syncNow(harness);
+    }
+    vi.useRealTimers();
+    expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(sendsAfterDispatch);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(stops(workflowCalls)).toEqual([]);
+    const overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks[0]!.stalled).toBe(false);
+  } finally {
+    vi.useRealTimers();
     await harness.lifecycle.dispose();
   }
 });

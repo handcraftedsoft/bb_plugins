@@ -110,6 +110,12 @@ export interface TaskMeta {
   deployRequested: boolean;
   workflowRunId: string | null;
   workflowStatus: string | null;
+  /** Live phase of the workflow run, read from the workflows plugin (not the driver's last report). */
+  workflowPhase: string | null;
+  /** Live run status (queued/running/succeeded/failed/cancelled) from the workflows plugin. */
+  runStatus: string | null;
+  /** When the live run view was last read. */
+  phaseAt: number | null;
 }
 
 /** Realtime channel the backend publishes on after every board change; the
@@ -299,8 +305,10 @@ const FEATURE_LINE = /^[\s>*_`#-]*feature[*_`]*\s*[:=][\s*_`]*([a-z0-9][a-z0-9-]
 const DEPLOY_VERB = String.raw`(?:re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?|ship(?:s|ped|ping)?|push(?:es|ed|ing)?|releas(?:e|es|ed|ing)|publish(?:es|ed|ing)?)`;
 const DEPLOY_EXPLICIT =
   /^[\s>*_`#-]*(?:deploy(?:ment)?|ship|push|release|deliver(?:y)?)(?:\s+requested)?[*_`]*\s*[:=]\s*[*_`]*\s*(yes|y|true|on|required|no|n|false|off|none|never|not)\b/gim;
+/** Negation cues shared by the deploy rules and question triage. */
+const NEGATION_CUE = String.raw`(?:no|not|never|without|nothing|don'?t|do\s+not|doesn'?t|does\s+not|shouldn'?t|should\s+not|must\s+not|mustn'?t|won'?t|will\s+not|avoid|skip)`;
 const DEPLOY_NEGATED = new RegExp(
-  String.raw`\b(?:no|not|never|without|nothing|don'?t|do\s+not|doesn'?t|does\s+not|shouldn'?t|should\s+not|must\s+not|mustn'?t|won'?t|will\s+not|avoid|skip)\b(?:\s+[\w'/-]+){0,3}?\s+${DEPLOY_VERB}\b`,
+  String.raw`\b${NEGATION_CUE}\b(?:\s+[\w'/-]+){0,3}?\s+${DEPLOY_VERB}\b`,
   "i",
 );
 const DEPLOY_AFFIRMATIVE: RegExp[] = [
@@ -334,16 +342,6 @@ export function deployIntent(text: string): DeployIntent {
   if (DEPLOY_AFFIRMATIVE.some((pattern) => pattern.test(plain))) return { requested: true, reason: "explicit deploy request" };
   return { requested: false, reason: "no explicit deploy request" };
 }
-
-/** Question topics that are irreversible or high impact regardless of task. */
-const IRREVERSIBLE_TOPIC =
-  /\b(delet\w*|remov\w* (?:the |all )?(?:data|users?|records?|accounts?|backups?)|drop(?:ping)?\s+(?:the\s+)?(?:table|database|column|schema)|truncat\w*|wip(?:e|es|ed|ing)\b|destroy\w*|purg\w*|irreversib\w*|destructive|migrat\w*\s+(?:on\s+|the\s+)?(?:prod|production|real|live)|secrets?|credentials?|passwords?|api[- ]?keys?|private[- ]keys?|(?:access|auth|api|bearer|refresh|github|vikunja|personal)\s+tokens?|keystores?|provisioning profiles?|signing (?:keys?|certificates?)|certificates?|pay(?:s|ing|ment|ments)?\b|purchas\w*|billing|invoic\w*|subscription\w*|spend\w*|send (?:an? |the )?(?:e-?mail|message|sms|newsletter|notification)s?|e-?mail (?:the |to )?(?:users|customers|people|denis)|tweet\w*|announc\w*|dns)\b/i;
-
-/** Push / deploy / production topics: allowed only when the task asked for
- * them. Feature nouns are not deploys: "push notifications", "release
- * build/APK/variant/notes", "deployment docs" stay routine. */
-const DEPLOY_TOPIC =
-  /\b(re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?\b(?!\s+(?:script|docs?|documentation)\b)|push(?:es|ed|ing)?\b(?!\s+(?:notifications?|messages?|tokens?|providers?|services?|payloads?)\b)|publish\w*|releas(?:e|es|ed|ing)\b(?!\s+(?:builds?|variants?|apks?|aabs?|notes|mode|config\w*|signing|types?)\b)|prod|production|go(?:es|ing)? live|app store|play store|testflight)\b/i;
 
 /** Filler dropped from feature slugs derived from a title. */
 const SLUG_FILLER = new Set([
@@ -388,7 +386,7 @@ export function classifyTask(
   task: Pick<VikunjaTask, "id" | "title" | "description" | "labels">,
   featureLabel: string,
   taken?: (name: string) => boolean,
-): Omit<TaskMeta, "workflowRunId" | "workflowStatus"> {
+): Omit<TaskMeta, "workflowRunId" | "workflowStatus" | "workflowPhase" | "runStatus" | "phaseAt"> {
   const text = `${task.title}\n${plainDescription(task.description)}`;
   const label = featureLabel.trim().toLowerCase();
   const line = FEATURE_LINE.exec(plainDescription(task.description));
@@ -403,15 +401,189 @@ export function classifyTask(
   };
 }
 
+// ---- question triage ------------------------------------------------------------
+// Rules (README "Irreversible questions"):
+//   * The question (plus its context) is split into clauses at sentence
+//     punctuation and contrastive conjunctions (but, however, unless, ...). A
+//     mention counts only when it is not negated: a negation cue (the same list
+//     the deploy rules use) at most three plain words before it in the same
+//     clause, with no punctuation, condition or "don't forget/hesitate"-style
+//     word in between ("no DNS change", "don't spend", "without touching certs").
+//     A negation in one clause never covers another clause.
+//   * Always irreversible: deleting/wiping data, prod migrations, force-push /
+//     history rewrites, secrets and credentials, external messages.
+//   * DNS and certificates/keystores: a mutating verb (change, update, issue,
+//     revoke, renew, ...) is irreversible; read-only context (check, inspect,
+//     dig, verify, "when does it expire") is routine; anything else is
+//     ambiguous and escalates. Local/debug/self-signed certs are routine unless
+//     production is mentioned.
+//   * Money: spending verbs (pay, buy, purchase, subscribe, upgrade to a paid
+//     tier) escalate unless the clause is an estimate ("how much would it cost
+//     to buy ...") with no "should I / and / then" before the verb; spending
+//     time/effort and code nouns ("purchase flow", "billing page") are routine.
+//   * Production config: changing prod config/env vars/feature flags escalates
+//     even when the task asked for a deploy.
+//   * Deploy/push/release/production: allowed only when the task asked for a
+//     deploy (same verbs as deployIntent); negated mentions do not count.
+
+const CLAUSE_SPLIT = /[?!;\n]+|\.(?=\s|$)|:(?=\s)|\s*,?\s*\b(?:but|however|although|though|except|unless|whereas)\b\s*/i;
+
+/** Words that, between a negation cue and a topic, break the negation's scope. */
+const SCOPE_BREAKERS = new Set([
+  "when", "if", "before", "after", "while", "once", "until", "because", "since", "by", "instead", "rather",
+  "sure", "certain", "clear", "whether", "yet", "only", "just", "but", "and", "or", "then", "also",
+  "should", "can", "could", "would", "will", "may", "might", "must", "shall",
+  "i", "we", "you", "they", "he", "she",
+  "forget", "hesitate", "wait", "worry", "fail", "delay", "mind", "stop", "hold",
+]);
+const NEGATION_TAIL = new RegExp(String.raw`\b(${NEGATION_CUE})((?:\s+[\w'/.-]+){0,3}?)\s*$`, "i");
+
+/** True when the mention starting at `index` is negated within its clause. */
+function negatedAt(clause: string, index: number): boolean {
+  const before = clause.slice(0, index);
+  const match = NEGATION_TAIL.exec(before);
+  if (match === null) return false;
+  const words = match[2]!.trim().split(/\s+/).filter((word) => word !== "");
+  if (words.some((word) => SCOPE_BREAKERS.has(word.toLowerCase()))) return false;
+  // "whether or not to delete", "if not delete": not a negation of the action.
+  const lead = before.slice(0, match.index).trim().split(/\s+/).pop()?.toLowerCase() ?? "";
+  if (lead === "or" || lead === "if" || lead === "whether") return false;
+  return true;
+}
+
+function liveHits(clause: string, pattern: RegExp): RegExpMatchArray[] {
+  const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g");
+  return [...clause.matchAll(global)].filter((hit) => !negatedAt(clause, hit.index!));
+}
+
+const ALWAYS_IRREVERSIBLE: Array<[RegExp, string]> = [
+  [/\b(?:delet\w*|remov\w* (?:the |all )?(?:data|users?|records?|accounts?|backups?)|drop(?:s|ped|ping)?\s+(?:the\s+|a\s+|this\s+|that\s+)?(?:[\w-]+\s+)?(?:tables?|databases?|dbs?|columns?|schemas?|collections?|indexes|buckets?)|truncat\w*|wip(?:e|es|ed|ing)\b|destroy\w*|purg\w*|irreversib\w*|destructive|migrat\w*\s+(?:on\s+|the\s+)?(?:prod|production|real|live))/i, "data loss"],
+  [/(?:\bforce[- ]?push\w*|\bpush\w*\s+(?:\S+\s+){0,3}?(?:--force\S*|-f)(?=\s|$)|--force-with-lease|\brewrit\w*\s+(?:the\s+)?(?:git\s+)?history|\breset\s+--hard)/i, "force-push / history rewrite"],
+  [/\b(?:secrets?|credentials?|passwords?|api[- ]?keys?|private[- ]keys?|(?:access|auth|api|bearer|refresh|github|vikunja|personal)\s+tokens?)\b/i, "secrets"],
+  [/\b(?:send\w*\s+(?:an?\s+|the\s+|out\s+)?(?:e-?mails?|messages?|sms|texts?|newsletters?|notifications?|dms?|invites?|invitations?)|e-?mail\w*\s+(?:the\s+|to\s+|all\s+)?(?:users|customers|people|denis|subscribers|everyone)|tweet\w*|announc\w*|post\w*\s+(?:it\s+|this\s+)?(?:to|on)\s+(?:twitter|x|slack|social|linkedin|reddit|discord|mastodon|hacker\s+news|product\s+hunt))\b/i, "external message"],
+];
+/** A test send to a local device is not an external message. */
+const LOCAL_SEND = /\b(?:emulator|simulator|test\s+device|my\s+(?:own\s+)?device|localhost|sandbox)\b/i;
+
+const NOUN_GUARD = String.raw`(?<!\b(?:the|a|an|this|that|these|those|any|each|dns|cert|certificate|ssl|tls)\s)`;
+const MUTATING = new RegExp(
+  NOUN_GUARD +
+    String.raw`\b(?:chang(?:e|es|ed|ing)|updat(?:e|es|ed|ing)|modif(?:y|ies|ied|ying)|edit(?:s|ed|ing)?|add(?:s|ed|ing)?|creat(?:e|es|ed|ing)|set(?:s|ting)?(?:\s+up)?|re-?point\w*|point(?:s|ed|ing)?\s+(?!to\b|at\b)[\w.-]+(?:\s+[\w.-]+)?\s+(?:at|to)|switch(?:es|ed|ing)?|mov(?:e|es|ed|ing)|migrat(?:e|es|ed|ing)|delet(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|transfer(?:s|red|ring)?|configur(?:e|es|ed|ing)|register(?:s|ed|ing)?|flip(?:s|ped|ping)?|replac(?:e|es|ed|ing)|enabl(?:e|es|ed|ing)|disabl(?:e|es|ed|ing)|appl(?:y|ies|ied|ying)|overrid(?:e|es|ing)|overrode|toggl(?:e|es|ed|ing)|reset(?:s|ting)?|cut(?:ting)?\s+over|rotat(?:e|es|ed|ing)|issu(?:e|es|ed|ing)|revok(?:e|es|ed|ing)|renew(?:s|ed|ing)?|install(?:s|ed|ing)?|generat(?:e|es|ed|ing)|request(?:s|ed|ing)?|upload(?:s|ed|ing)?|import(?:s|ed|ing)?|deploy(?:s|ed|ing)?|publish(?:es|ed|ing)?|push(?:es|ed|ing)?)\b`,
+  "i",
+);
+/** "is configured", "be changed": describes a state, not an action to take. */
+const PASSIVE_LEAD = /\b(?:is|are|was|were|been|be|get|gets|got)\s+(?:\w+\s+)?$/i;
+const READ_CUE =
+  /\b(?:check\w*|inspect\w*|look(?:s|ed|ing)?\s+(?:up|at)|lookup|read(?:s|ing)?|view\w*|list\w*|query\w*|dig|nslookup|whois|resolv\w*|verif\w*|confirm\w*|see|show\w*|audit\w*|monitor\w*|test\w*|validat\w*|examin\w*|review\w*|compar\w*|diagnos\w*|debug\w*|investigat\w*|propagat\w*|expir\w*|what|which|where|why|when|how|does|is|are|status)\b/i;
+
+function mutates(clause: string): boolean {
+  return liveHits(clause, MUTATING).some((hit) => !PASSIVE_LEAD.test(clause.slice(0, hit.index!)));
+}
+
+const DNS_TOPIC = /\b(?:dns|nameservers?|name\s+servers?|cname|aaaa|mx\s+records?|txt\s+records?|zone\s+files?|domain\s+records?)\b/i;
+const DNS_RECORD_TYPE = /\b(?:A|AAAA|CNAME|MX|TXT|NS|SRV|CAA)\s+records?\b/; // case-sensitive: "a record" is not DNS
+const CERT_TOPIC =
+  /\b(?:certificates?|certs?|keystores?|provisioning\s+profiles?|signing\s+(?:keys?|certificates?|identit(?:y|ies)|configs?)|ssl|tls|csr|let'?s\s*encrypt|acme|certbot)\b/i;
+const LOCAL_CERT = /\b(?:local(?:host)?|dev(?:elopment)?|debug|self-?signed|test(?:ing)?|emulator|simulator)\b/i;
+const PROD_MENTION = /\b(?:prod(?:uction)?|live|release|play\s+store|app\s+store|testflight|vps|public)\b/i;
+
+const SPEND_VERB =
+  /\b(?:pay(?:s|ing)?|paid|purchas(?:e|es|ed|ing)|buy(?:s|ing)?|bought|subscrib(?:e|es|ed|ing)|spend(?:s|ing)?|spent|charg(?:e|es|ed|ing)\s+(?:the\s+|my\s+|a\s+|our\s+|his\s+|her\s+)?(?:card|credit\s+card|account)|top\s+up|upgrad(?:e|es|ed|ing)\s+(?:\S+\s+){0,3}?(?:to\s+)?(?:a\s+)?(?:paid|pro|premium|business|team|plus)\b)/i;
+const SPEND_NOUN = /\b(?:payments?|billing|invoic(?:e|es)|subscriptions?|credit\s+cards?|pricing\s+plans?)\b/i;
+/** Product/code nouns: "purchase flow", "billing page", "paying users". */
+const CODE_NOUN =
+  /^\s*(?:[\w-]+\s+)?(?:flows?|pages?|screens?|buttons?|forms?|apis?|sdks?|endpoints?|tests?|logic|ui|components?|modules?|webhooks?|integrations?|history|receipts?|validation|handlers?|models?|tables?|dialogs?|sheets?|users?|customers?|members?|plans?|tiers?|features?|wall|status|state|methods?|providers?|gateway|intents?|events?|code|schema|ux|copy|mocks?|stubs?|sandbox)\b/i;
+const SPEND_RESOURCE = /^\s*(?:(?:more|less|some|a\s+lot\s+of|extra|an?|the|much|any|\d+)\s+)?(?:time|hours?|minutes?|days?|weeks?|effort|while|cycles|energy|attention)\b/i;
+const ESTIMATE_CUE = /\b(?:estimat\w*|how\s+much|costs?|pric(?:e|es|ing)|quot(?:e|es)|budget\w*|forecast\w*|calculat\w*|compar\w*|projected)\b/i;
+const PERMISSION_CUE = /\b(?:should|can|could|may|ok(?:ay)?\s+to|go\s+ahead|proceed|approv\w*|authori[sz]\w*|and|then|let\s+me|i'?ll|we'?ll)\b/i;
+
+function spendVerdict(clause: string): "irreversible" | "routine" | null {
+  let routine = false;
+  for (const hit of liveHits(clause, SPEND_VERB)) {
+    const after = clause.slice(hit.index! + hit[0].length);
+    if (/^spen[dt]/i.test(hit[0]) && SPEND_RESOURCE.test(after)) { routine = true; continue; }
+    if (CODE_NOUN.test(after) && !/^(?:spen|top|upgrad|charg)/i.test(hit[0])) { routine = true; continue; }
+    const before = clause.slice(0, hit.index!);
+    const estimate = [...before.matchAll(new RegExp(ESTIMATE_CUE.source, "gi"))].pop();
+    if (estimate !== undefined && !PERMISSION_CUE.test(before.slice(estimate.index! + estimate[0].length))) {
+      routine = true;
+      continue;
+    }
+    return "irreversible";
+  }
+  for (const hit of liveHits(clause, SPEND_NOUN)) {
+    const after = clause.slice(hit.index! + hit[0].length);
+    if (CODE_NOUN.test(after)) { routine = true; continue; }
+    if (mutates(clause)) return "irreversible";
+    if (READ_CUE.test(clause) || ESTIMATE_CUE.test(clause)) { routine = true; continue; }
+    return "irreversible"; // ambiguous money question
+  }
+  return routine ? "routine" : null;
+}
+
+function infraVerdict(clause: string, dns: boolean): "irreversible" | "routine" | null {
+  const mentioned = dns
+    ? liveHits(clause, DNS_TOPIC).length > 0 || liveHits(clause, DNS_RECORD_TYPE).length > 0
+    : liveHits(clause, CERT_TOPIC).length > 0;
+  if (!mentioned) return null;
+  if (!dns && LOCAL_CERT.test(clause) && !PROD_MENTION.test(clause)) return "routine";
+  if (mutates(clause)) return "irreversible";
+  if (READ_CUE.test(clause)) return "routine";
+  return "irreversible"; // genuinely ambiguous: escalate
+}
+
+const PROD_WORD = /\b(?:prod(?:uction)?)\b/i;
+const PROD_CONFIG = /(?:\bconfig\w*|\bsettings?\b|\benv(?:ironment)?\s+var\w*|\.env\b|\bfeature\s+flags?|\bflags?\b|\bvariables?\b)/i;
+/** Push / deploy / production topics: allowed only when the task asked for
+ * them. Feature nouns are not deploys: "push notifications", "release
+ * build/APK/variant/notes", "deployment docs" stay routine. */
+const DEPLOY_TOPIC =
+  /\b(re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?\b(?!\s+(?:script|docs?|documentation)\b)|push(?:es|ed|ing)?\b(?!\s+(?:notifications?|messages?|tokens?|providers?|services?|payloads?)\b)|publish\w*|releas(?:e|es|ed|ing)\b(?!\s+(?:builds?|variants?|apks?|aabs?|notes|mode|config\w*|signing|types?)\b)|prod|production|go(?:es|ing)? live|app store|play store|testflight)\b/i;
+const LOCAL_TARGET = /\b(?:emulator|simulator|localhost|local\s+(?:main|branch|repo\w*|checkout|worktree))\b/i;
+
 export type QuestionClass = "routine" | "irreversible" | "deploy-allowed";
+
+export interface QuestionTriage {
+  class: QuestionClass;
+  reason: string;
+}
+
+/** Decide how a worker question is handled, with the rule that decided it. */
+export function triageQuestion(question: string, deployRequested: boolean, declared?: DecisionKind): QuestionTriage {
+  const text = String(question ?? "").replace(/[’‘]/g, "'").replace(/[*_`]/g, "");
+  const clauses = text.split(CLAUSE_SPLIT).map((clause) => clause?.trim() ?? "").filter((clause) => clause !== "");
+  let deploy = false;
+  for (const clause of clauses) {
+    for (const [pattern, reason] of ALWAYS_IRREVERSIBLE) {
+      if (reason === "external message" && LOCAL_SEND.test(clause)) continue;
+      if (liveHits(clause, pattern).length > 0) return { class: "irreversible", reason };
+    }
+    if (infraVerdict(clause, true) === "irreversible") return { class: "irreversible", reason: "DNS change" };
+    if (infraVerdict(clause, false) === "irreversible") return { class: "irreversible", reason: "certificate/signing change" };
+    if (spendVerdict(clause) === "irreversible") return { class: "irreversible", reason: "spending money" };
+    if (liveHits(clause, PROD_WORD).length > 0 && PROD_CONFIG.test(clause) && mutates(clause)) {
+      return { class: "irreversible", reason: "production config change" };
+    }
+    if (!LOCAL_TARGET.test(clause)) {
+      const hits = liveHits(clause, DEPLOY_TOPIC);
+      const onlyProdNoun = hits.length > 0 && hits.every((hit) => /^prod(?:uction)?$/i.test(hit[0]));
+      // "check the prod logs": reading production is routine; acting on it is a deploy question.
+      if (hits.length > 0 && !(onlyProdNoun && !mutates(clause) && READ_CUE.test(clause))) deploy = true;
+    }
+  }
+  if (deploy) {
+    return deployRequested
+      ? { class: "deploy-allowed", reason: "deploy/push requested by the task" }
+      : { class: "irreversible", reason: "deploy/push not requested by the task" };
+  }
+  if (declared === "irreversible") return { class: "irreversible", reason: "declared irreversible by the worker" };
+  return { class: "routine", reason: "no irreversible action" };
+}
 
 /** Decide how a worker question is handled. Irreversible questions bypass the
  * keyword policies and never time out into "best judgment". */
 export function classifyQuestion(question: string, deployRequested: boolean, declared?: DecisionKind): QuestionClass {
-  if (IRREVERSIBLE_TOPIC.test(question)) return "irreversible";
-  if (DEPLOY_TOPIC.test(question)) return deployRequested ? "deploy-allowed" : "irreversible";
-  if (declared === "irreversible") return "irreversible";
-  return "routine";
+  return triageQuestion(question, deployRequested, declared).class;
 }
 
 export const FINISHED_WORKFLOW_STATUSES = ["merged-to-main", "delivered"] as const;
@@ -691,6 +863,9 @@ export interface TaskBrief {
   threadStatus: string | null;
   error: string | null;
   closedAt: number | null;
+  /** Feature tasks: the live workflow phase and run status (workflows plugin). */
+  workflowPhase?: string | null;
+  runStatus?: string | null;
 }
 
 export interface BriefingInput {
@@ -714,6 +889,9 @@ function line(item: TaskBrief, now: number): string {
     if (item.stalled) {
       parts.push(`stalled: no progress, nudged ${item.nudgeCount}×`);
     } else {
+      if (item.workflowPhase != null || item.runStatus != null) {
+        parts.push(`workflow ${[item.runStatus, item.workflowPhase === null || item.workflowPhase === undefined ? null : `phase ${item.workflowPhase}`].filter(Boolean).join(", ")}`);
+      }
       const note = item.progressNote === null ? "no report yet" : `last: ${item.progressNote}`;
       parts.push(`${note} (${formatAge(item.progressAt, now)})`);
       if (item.threadStatus !== null && item.threadStatus !== "idle") {

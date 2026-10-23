@@ -31,6 +31,8 @@ function overviewFixture(overrides: Partial<Overview> = {}): Overview {
         mode: "task",
         deployRequested: false,
         workflowStatus: null,
+        workflowPhase: null,
+        runStatus: null,
       },
     ],
     decisions: [

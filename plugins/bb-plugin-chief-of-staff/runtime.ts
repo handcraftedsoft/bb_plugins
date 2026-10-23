@@ -42,6 +42,24 @@ const VIKUNJA_PLUGIN_ID = "vikunja";
 const AUTO_RETRIES = 1;
 const MAX_TASK_PAGES = 10;
 const VIEW_CACHE_MS = 10 * 60_000;
+/** The builtin workflows plugin (owns feature-delivery runs; exposes run view/stop RPCs). */
+const WORKFLOWS_PLUGIN_ID = "workflows";
+/**
+ * Workflow phases a close-in-Vikunja never interrupts: a half-applied merge or
+ * delivery is worse than closing a few minutes late. The chief of staff waits
+ * for the run to leave these phases (or finish), then closes.
+ */
+const UNINTERRUPTIBLE_PHASES = new Set(["merge", "deliver"]);
+/** Prefix of the row error while a Vikunja close waits for an in-flight Merge/Deliver. */
+export const VIKUNJA_CLOSE_PENDING = "closed in Vikunja; waiting for the in-flight";
+
+type LeftVikunja = "done" | "deleted" | "unassigned";
+
+interface ActiveRunView {
+  id: string;
+  status: string;
+  currentPhase: string | null;
+}
 
 /** Branch and worktree names in a local git checkout (feature slug collision
  * check). Best effort: any failure yields no names. */
@@ -89,6 +107,9 @@ export interface TaskView {
   mode: TaskMeta["mode"];
   deployRequested: boolean;
   workflowStatus: string | null;
+  /** Live workflow phase / run status (workflows plugin), feature tasks only. */
+  workflowPhase: string | null;
+  runStatus: string | null;
 }
 
 export interface DecisionView {
@@ -371,14 +392,57 @@ export class ChiefOfStaff {
     await this.moveTaskToColumn(task, "doing", "dispatched");
   }
 
-  /** Feature drivers: follow the workflow run's phase from the driver thread's timeline. */
+  /**
+   * Feature drivers: read the live run (id, status, current phase) from the
+   * workflows plugin and store it, so status, brief and kanban never depend on
+   * the driver reporting each phase. Uses the reported run id, else the latest
+   * run started from the driver thread. Returns the live phase (the last known
+   * one once the run is terminal), or null when the run cannot be read.
+   */
+  async refreshLiveRun(taskId: number, threadId: string): Promise<string | null> {
+    const meta = this.store.getTaskMeta(taskId);
+    if (meta === null || meta.mode !== "feature") return null;
+    type RunView = { id?: unknown; status?: unknown; currentPhase?: unknown };
+    let run: RunView | null = null;
+    for (const runId of meta.workflowRunId === null ? [null] : [meta.workflowRunId, null]) {
+      try {
+        const view: { run?: RunView | null } | null = await this.workflowsRpc<{ run?: RunView | null }>("workflowRunView", { threadId, runId });
+        run = view?.run ?? null;
+        if (run !== null) break;
+      } catch {
+        // reported run not started from this thread (e.g. adopted driver): try its latest run
+      }
+    }
+    if (run === null || typeof run.id !== "string") return null;
+    const status = typeof run.status === "string" ? run.status : null;
+    const phase = typeof run.currentPhase === "string" && run.currentPhase !== "" ? run.currentPhase : meta.workflowPhase;
+    if (meta.workflowRunId !== run.id || meta.runStatus !== status || meta.workflowPhase !== phase) {
+      this.store.setTaskMeta(taskId, { workflowRunId: run.id, runStatus: status, workflowPhase: phase, phaseAt: Date.now() });
+      this.publish();
+    } else {
+      this.store.setTaskMeta(taskId, { phaseAt: Date.now() });
+    }
+    return phase;
+  }
+
+  /** Live run views for every active/paused feature task with a driver thread (CLI, panel, brief). */
+  async refreshLivePhases(): Promise<void> {
+    for (const row of this.store.listTasks()) {
+      if (row.threadId === null || row.state === "closed") continue;
+      await this.refreshLiveRun(row.taskId, row.threadId);
+    }
+  }
+
+  /** Feature drivers: follow the live workflow phase (timeline fallback) on the kanban. */
   private async syncWorkflowPhase(taskId: number, projectId: number, threadId: string): Promise<void> {
-    let phase: string | null = null;
-    try {
-      const timeline = await this.bb.sdk.threads.timeline({ threadId, deferContent: "true" } as never);
-      phase = workflowPhaseFromTimeline(timeline);
-    } catch {
-      return; // timeline is optional; the driver's phase reports still move the card
+    let phase: string | null = await this.refreshLiveRun(taskId, threadId);
+    if (phase === null) {
+      try {
+        const timeline = await this.bb.sdk.threads.timeline({ threadId, deferContent: "true" } as never);
+        phase = workflowPhaseFromTimeline(timeline);
+      } catch {
+        return; // optional; the driver's phase reports still move the card
+      }
     }
     const column = columnForPhase(phase);
     if (column !== null && column !== "done") {
@@ -743,18 +807,23 @@ export class ChiefOfStaff {
       case "blocked":
         this.store.updateTask(task.taskId, { progressNote: `blocked: ${trimmed ?? "no detail"}`, progressAt: now });
         break;
-      case "done":
+      case "done": {
+        // Closed in Vikunja while a Merge/Deliver was in flight: the task is already
+        // done/deleted/unassigned there, so do not touch it; keep the pending marker
+        // so the next sweep stops/archives the worker and leaves the close comment.
+        const closingFromVikunja = task.error?.startsWith(VIKUNJA_CLOSE_PENDING) ?? false;
         this.store.updateTask(task.taskId, {
           state: "closed",
           closedAt: now,
           progressNote: trimmed ?? "reported done",
           progressAt: now,
           stalled: 0,
-          error: null,
+          error: closingFromVikunja ? task.error : null,
         });
         this.dismissStaleDecisionsForTask(task.taskId);
-        void this.completeInVikunja(task.taskId, task.projectId, trimmed ?? "reported done");
+        if (!closingFromVikunja) void this.completeInVikunja(task.taskId, task.projectId, trimmed ?? "reported done");
         break;
+      }
       case "failed":
         this.store.updateTask(task.taskId, {
           error: trimmed ?? "worker reported failure",
@@ -802,6 +871,136 @@ export class ChiefOfStaff {
       await this.bb.sdk.threads.stop({ threadId });
     } catch (cause) {
       this.bb.log.warn(`stop thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  }
+
+  private async archiveThreadQuietly(threadId: string): Promise<void> {
+    try {
+      await this.bb.sdk.threads.archive({ threadId });
+    } catch (cause) {
+      this.bb.log.warn(`archive thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  }
+
+  private async workflowsRpc<T>(method: string, input: unknown): Promise<T> {
+    return this.bb.sdk.plugins.callRpc<T>({
+      pluginId: WORKFLOWS_PLUGIN_ID,
+      method,
+      input: input as never,
+      outputSchema: z.unknown() as never,
+    }) as Promise<T>;
+  }
+
+  /** Queued/running workflow runs started from a worker thread; null when the workflows plugin cannot be asked. */
+  private async activeRunsForThread(threadId: string): Promise<ActiveRunView[] | null> {
+    try {
+      const result = await this.workflowsRpc<{ runs?: unknown }>("workflowActiveRuns", { threadId });
+      const runs = Array.isArray(result?.runs) ? result.runs : [];
+      return runs
+        .filter((run): run is { id: string; status?: unknown; currentPhase?: unknown } =>
+          typeof run === "object" && run !== null && typeof (run as { id?: unknown }).id === "string")
+        .map((run) => ({
+          id: run.id,
+          status: typeof run.status === "string" ? run.status : "unknown",
+          currentPhase: typeof run.currentPhase === "string" ? run.currentPhase : null,
+        }))
+        .filter((run) => run.status === "queued" || run.status === "running");
+    } catch (cause) {
+      this.bb.log.warn(`active runs for ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Why a tracked task is no longer an open CTO-bot task, confirmed with a direct
+   * lookup (the bulk list can miss a task transiently). null = still open, or the
+   * lookup failed: never close on a guess.
+   */
+  private async confirmLeftVikunja(taskId: number, assignee: string): Promise<LeftVikunja | null> {
+    try {
+      const envelope = await this.vikunja<unknown>("call", {
+        name: "tasks_list",
+        arguments: { page: 1, per_page: 50, filter: `id = ${taskId}` },
+      });
+      const parsed = parseVikunjaTasksPage(envelope);
+      if (parsed === null) return null;
+      const task = parsed.tasks.find((candidate) => candidate.id === taskId);
+      if (task === undefined) return parsed.tasks.length === 0 ? "deleted" : null;
+      if (task.done) return "done";
+      if (filterByAssignee([task], assignee).length === 0) return "unassigned";
+      return null;
+    } catch (cause) {
+      this.bb.log.warn(`confirm task ${taskId}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Closes a tracked task that is done, deleted or unassigned in Vikunja, whatever
+   * its plugin state (active, paused, waiting on a decision). Cancels the worker's
+   * queued/running workflow runs (a cancelled run's feature-delivery lock and queue
+   * entry count as stale, so the next run takes the lock; the closed row frees the
+   * maxFeatureRuns/maxConcurrent slot), stops and archives the worker thread, and
+   * leaves one Vikunja comment. A run in Merge/Deliver is never cancelled: the row
+   * keeps a pending marker and a later sweep closes it once the run moved on.
+   * Idempotent: closed rows without the marker are never revisited.
+   */
+  private async closeTaskLeftVikunja(row: TaskRow, why: LeftVikunja): Promise<void> {
+    const threadId = row.threadId;
+    const thread = threadId === null ? null : await this.threadAlive(threadId);
+    const live = threadId !== null && thread !== null && thread.archivedAt === null;
+    const stoppedRuns: string[] = [];
+    if (live) {
+      const runs = await this.activeRunsForThread(threadId);
+      if (runs === null) {
+        // Cannot see the runs: do not archive (that would stop them blind); retry next sweep.
+        if (this.store.getTaskMeta(row.taskId)?.mode === "feature") return;
+      } else {
+        const critical = runs.find((run) => UNINTERRUPTIBLE_PHASES.has((run.currentPhase ?? "").toLowerCase()));
+        if (critical !== undefined) {
+          const note = `${VIKUNJA_CLOSE_PENDING} ${critical.currentPhase} of ${critical.id} to finish`;
+          if (row.error !== note) {
+            this.store.updateTask(row.taskId, { error: note });
+            this.bb.log.info(`task ${row.taskId} ${why} in Vikunja; waiting for ${critical.currentPhase} of ${critical.id} before closing`);
+          }
+          return;
+        }
+        for (const run of runs) {
+          try {
+            await this.workflowsRpc("workflowStopRun", { threadId, runId: run.id });
+            stoppedRuns.push(run.id);
+          } catch (cause) {
+            this.bb.log.warn(`stop run ${run.id} for task ${row.taskId}: ${cause instanceof Error ? cause.message : String(cause)}`);
+            return; // retry next sweep; never leave a run behind a closed row
+          }
+        }
+      }
+      // The worker already reported done after the Merge: let its last turn finish.
+      if (row.state === "closed" && thread.status !== "idle") return;
+    }
+    const now = Date.now();
+    this.store.updateTask(row.taskId, {
+      state: "closed",
+      closedAt: row.closedAt ?? now,
+      stalled: 0,
+      error: null,
+      progressNote: `closed in Vikunja (${why})`,
+      progressAt: now,
+    });
+    this.dismissStaleDecisionsForTask(row.taskId);
+    if (live) {
+      await this.stopThreadQuietly(threadId);
+      await this.archiveThreadQuietly(threadId);
+    }
+    this.bb.log.info(
+      `task ${row.taskId} ${why} in Vikunja: closed${live ? `, stopped worker ${threadId}` : ""}${stoppedRuns.length > 0 ? `, cancelled ${stoppedRuns.join(", ")}` : ""}`,
+    );
+    if (why !== "deleted") {
+      const stopped = [live ? "worker" : null, stoppedRuns.length > 0 ? "run" : null].filter(Boolean).join("/");
+      await this.commentOnTaskId(
+        row.taskId,
+        `Chief of Staff: closed in Vikunja (${why}); ${stopped === "" ? "nothing was running" : `stopped ${stopped}`}${stoppedRuns.length > 0 ? ` (${stoppedRuns.join(", ")})` : ""}.`,
+      );
     }
   }
 
@@ -907,6 +1106,18 @@ export class ChiefOfStaff {
       const open = new Map(tasks.map((task) => [task.id, task]));
       const now = Date.now();
 
+      // Rows whose task left the open set (done, deleted, or unassigned in Vikunja),
+      // in any plugin state; each one is confirmed individually before closing. Runs
+      // first so a freed feature slot is reused by this same sweep.
+      for (const row of this.store.listTasks()) {
+        if (open.has(row.taskId)) continue;
+        const pendingClose = row.error?.startsWith(VIKUNJA_CLOSE_PENDING) ?? false;
+        if (row.state === "closed" && !pendingClose) continue;
+        const why = await this.confirmLeftVikunja(row.taskId, settings.assignee);
+        if (why === null) continue;
+        await this.closeTaskLeftVikunja(row, why);
+      }
+
       for (const task of tasks) {
         const row = this.store.getTask(task.id);
         if (row === null || row.threadId === null) {
@@ -916,6 +1127,10 @@ export class ChiefOfStaff {
         // Keep the row's title fresh even when nothing else changes.
         if (row.title !== task.title || row.projectId !== task.projectId) {
           this.store.updateTask(task.id, { title: task.title, projectId: task.projectId });
+        }
+        if (row.error?.startsWith(VIKUNJA_CLOSE_PENDING) && row.state !== "closed") {
+          // Reopened/reassigned while the close waited on a Merge: keep working.
+          this.store.updateTask(task.id, { error: null });
         }
         if (row.state === "paused") {
           this.store.updateTask(task.id, { lastTaskUpdated: task.updated });
@@ -955,6 +1170,13 @@ export class ChiefOfStaff {
 
         // Keep moving: nudge idle, quiet workers that are not waiting on the user.
         if (this.store.hasPendingDecisionForTask(task.id)) continue;
+        // An idle driver whose workflow run is queued/running is waiting for the
+        // run's completion notification, not stuck: never nudge it.
+        const liveStatus = this.store.getTaskMeta(task.id)?.runStatus ?? null;
+        if (rowMeta?.mode === "feature" && (liveStatus === "queued" || liveStatus === "running")) {
+          if (row.stalled === 1) this.store.updateTask(task.id, { stalled: 0 });
+          continue;
+        }
         const thread = await this.threadAlive(row.threadId);
         if (thread === null || thread.status !== "idle") {
           if (row.stalled === 1) this.store.updateTask(task.id, { stalled: 0 });
@@ -977,23 +1199,6 @@ export class ChiefOfStaff {
           this.bb.log.warn(
             `nudge task ${task.id}: ${cause instanceof Error ? cause.message : String(cause)}`,
           );
-        }
-      }
-
-      // Rows whose task left the open set: completed, closed, or unassigned.
-      for (const row of this.store.listTasks()) {
-        if (row.state !== "active" || open.has(row.taskId)) continue;
-        this.store.updateTask(row.taskId, { state: "closed", closedAt: now, stalled: 0 });
-        this.dismissStaleDecisionsForTask(row.taskId);
-        if (row.threadId !== null && (await this.threadAlive(row.threadId)) !== null) {
-          try {
-            await this.sendToThread(
-              row.threadId,
-              "Your Vikunja task was completed or unassigned in the meantime. Wrap up and stop; no further work is needed.",
-            );
-          } catch {
-            // the wrap-up notice is best effort
-          }
         }
       }
 
@@ -1050,6 +1255,7 @@ export class ChiefOfStaff {
 
   async refreshBriefing(configured?: boolean): Promise<BriefingRow> {
     const ready = configured ?? (await this.vikunjaConfigured());
+    if (!this.sweeping) await this.refreshLivePhases(); // the sweep already refreshed them
     const latest = this.store.latestBriefing();
     const tasks = this.store.listTasks();
     const pending = this.store.listDecisions().filter((decision) => decision.status === "pending");
@@ -1070,6 +1276,7 @@ export class ChiefOfStaff {
         threadStatus: null,
         error: task.error,
         closedAt: task.closedAt,
+        ...this.liveRunBrief(task.taskId),
       })),
       pendingDecisions: pending.flatMap((decision) => {
         const task = byId.get(decision.itemId);
@@ -1082,6 +1289,7 @@ export class ChiefOfStaff {
   }
 
   async overview(): Promise<Overview> {
+    await this.refreshLivePhases();
     const settings = await this.readSettings();
     const configured = await this.vikunjaConfigured();
     const tasks = this.store.listTasks();
@@ -1154,13 +1362,30 @@ export class ChiefOfStaff {
     };
   }
 
-  metaView(taskId: number): Pick<TaskView, "mode" | "deployRequested" | "workflowStatus"> {
+  metaView(taskId: number): Pick<TaskView, "mode" | "deployRequested" | "workflowStatus" | "workflowPhase" | "runStatus"> {
     const meta = this.store.getTaskMeta(taskId);
     return {
       mode: meta?.mode ?? "task",
       deployRequested: meta?.deployRequested ?? false,
       workflowStatus: meta?.workflowStatus ?? null,
+      workflowPhase: meta?.workflowPhase ?? null,
+      runStatus: meta?.runStatus ?? null,
     };
+  }
+
+  private liveRunBrief(taskId: number): { workflowPhase: string | null; runStatus: string | null } {
+    const meta = this.store.getTaskMeta(taskId);
+    if (meta?.mode !== "feature") return { workflowPhase: null, runStatus: null };
+    return { workflowPhase: meta.workflowPhase, runStatus: meta.runStatus };
+  }
+
+  /** One-line status of a task's workflow for the CLI: live run first, reported status as fallback. */
+  workflowLabel(taskId: number): string {
+    const meta = this.store.getTaskMeta(taskId);
+    if (meta?.mode !== "feature") return "";
+    const live = [meta.runStatus, meta.workflowPhase === null ? null : `phase ${meta.workflowPhase}`].filter(Boolean).join(", ");
+    if (live !== "") return `, feature ${live}${meta.workflowStatus !== null && meta.runStatus !== "running" && meta.runStatus !== "queued" ? ` (${meta.workflowStatus})` : ""}`;
+    return `, feature${meta.workflowStatus === null ? "" : ` ${meta.workflowStatus}`}`;
   }
 
   // ---- plumbing ----

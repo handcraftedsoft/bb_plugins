@@ -232,6 +232,7 @@ export interface NewDecision {
 export class ChiefStore {
   constructor(private readonly db: Database.Database) {
     for (const statement of SCHEMA) this.db.exec(statement);
+    this.migrateTaskMeta();
     this.seedBuiltinPolicies();
   }
 
@@ -265,11 +266,21 @@ export class ChiefStore {
     reconcile();
   }
 
+  /** v0.4: live workflow run view per feature task (phase, run status, read time). */
+  private migrateTaskMeta(): void {
+    const columns = new Set(
+      this.db.prepare<[], { name: string }>("PRAGMA table_info(cos_task_meta)").all().map((column) => column.name),
+    );
+    if (!columns.has("workflow_phase")) this.db.exec("ALTER TABLE cos_task_meta ADD COLUMN workflow_phase TEXT");
+    if (!columns.has("run_status")) this.db.exec("ALTER TABLE cos_task_meta ADD COLUMN run_status TEXT");
+    if (!columns.has("phase_at")) this.db.exec("ALTER TABLE cos_task_meta ADD COLUMN phase_at INTEGER");
+  }
+
   // ---- routing facts per task ----
 
   getTaskMeta(taskId: number): TaskMeta | null {
     const record = this.db
-      .prepare<[number], { task_id: number; mode: string; feature: string | null; deploy_requested: number; workflow_run_id: string | null; workflow_status: string | null }>(
+      .prepare<[number], { task_id: number; mode: string; feature: string | null; deploy_requested: number; workflow_run_id: string | null; workflow_status: string | null; workflow_phase: string | null; run_status: string | null; phase_at: number | null }>(
         "SELECT * FROM cos_task_meta WHERE task_id = ?",
       )
       .get(taskId);
@@ -281,6 +292,9 @@ export class ChiefStore {
       deployRequested: record.deploy_requested === 1,
       workflowRunId: record.workflow_run_id,
       workflowStatus: record.workflow_status,
+      workflowPhase: record.workflow_phase,
+      runStatus: record.run_status,
+      phaseAt: record.phase_at,
     };
   }
 
@@ -292,17 +306,25 @@ export class ChiefStore {
       deployRequested: false,
       workflowRunId: null,
       workflowStatus: null,
+      workflowPhase: null,
+      runStatus: null,
+      phaseAt: null,
     };
     const next = { ...current, ...patch };
     this.db
       .prepare(
-        `INSERT INTO cos_task_meta (task_id, mode, feature, deploy_requested, workflow_run_id, workflow_status, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO cos_task_meta (task_id, mode, feature, deploy_requested, workflow_run_id, workflow_status,
+           workflow_phase, run_status, phase_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET mode = excluded.mode, feature = excluded.feature,
            deploy_requested = excluded.deploy_requested, workflow_run_id = excluded.workflow_run_id,
-           workflow_status = excluded.workflow_status, updated_at = excluded.updated_at`,
+           workflow_status = excluded.workflow_status, workflow_phase = excluded.workflow_phase,
+           run_status = excluded.run_status, phase_at = excluded.phase_at, updated_at = excluded.updated_at`,
       )
-      .run(taskId, next.mode, next.feature, next.deployRequested ? 1 : 0, next.workflowRunId, next.workflowStatus, now);
+      .run(
+        taskId, next.mode, next.feature, next.deployRequested ? 1 : 0, next.workflowRunId, next.workflowStatus,
+        next.workflowPhase, next.runStatus, next.phaseAt, now,
+      );
     return this.getTaskMeta(taskId)!;
   }
 

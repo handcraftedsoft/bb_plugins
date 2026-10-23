@@ -18,7 +18,18 @@ Build → *Testing* when Verify starts (incl. the Merge checks) → back to
 column keeps the card in Doing. Workers drive it with the
 `chief_of_staff_report` `phase` field (feature drivers: the workflow phase from
 `bb workflows status`, `repair` when Verify sent it back; plain workers:
-`verifying` / `building`).
+`verifying` / `building`). For features the plugin also reads the live run
+(run id → status and current phase) from the workflows plugin on every sweep,
+`bb chief tasks` and brief, so `#12 (active, feature running, phase Build)` is
+current even when the driver reported only at launch.
+
+A task marked done, deleted or unassigned from the managed user in Vikunja is
+closed by the next sweep whatever its state: queued/running workflow runs are
+cancelled (which releases the feature-delivery Queue lock and the
+`maxFeatureRuns` slot), the worker thread is stopped and archived, and one
+comment is left. A run in Merge/Deliver is left to finish first (the task shows
+`closed in Vikunja; waiting for the in-flight Merge …`); do not cancel it by
+hand.
 
 Use the `bb chief` CLI to inspect and drive it:
 
@@ -69,9 +80,15 @@ Operating constraints:
   once tests pass.
 - **Reversible vs irreversible:** code, docs, tests, local commits and merging
   into local main need no approval. Irreversible/high-impact questions
-  (deleting data, destructive migrations, secrets, paid actions, external
-  messages, production the task did not ask for) skip the policies, wait for
+  (deleting data, destructive migrations, force-push, secrets, spending money,
+  external messages, changing DNS records, issuing/revoking production certs,
+  production config changes, production the task did not ask for) skip the
+  policies, wait for
   Denis without a timeout, and a dismissal means **no**
   (`chief_of_staff_ask` with `kind: "irreversible"`, also detected from the
   question text). Push/deploy questions are auto-allowed only when the task
-  text explicitly asked for a push/deploy/release.
+  text explicitly asked for a push/deploy/release. Detection is negation- and
+  context-aware: "no DNS change", "don't spend", "without touching certs",
+  reading DNS/certs and estimating cost are routine; genuinely ambiguous DNS,
+  cert or money questions escalate. Phrase questions plainly, one action per
+  sentence.
