@@ -172,6 +172,31 @@ test("dependency layers: inference and explicit lines", async () => {
   expect(explicit.resources).toEqual([]);
   expect(explicit.softAfter).toEqual(["admin-web"]);
   expect(describeDeps(explicit)).toContain("soft: admin-web");
+  // Mechanical / applicationId rename: android-sdk-gradle only, never infer emulator.
+  const rename = classifyDependencies(
+    {
+      title: "Rename Android applicationId",
+      description: "Size: small\nTags: mechanical, applicationId-only\nResources: android-sdk-gradle\nDepends-on: none\nSoft-after: none\nRename the applicationId/namespace only; no UX or behavior change.",
+    },
+    "android-package-rename",
+  );
+  expect(rename.resources).toEqual(["android-sdk-gradle"]);
+  expect(rename.resources).not.toContain("emulator");
+  const renameInferred = classifyDependencies(
+    {
+      title: "Rename Android package name",
+      description: "Size: small\nRename the Android applicationId and namespace only. No UX change.",
+    },
+    "android-package-rename",
+  );
+  expect(renameInferred.resources).toEqual(["android-sdk-gradle"]);
+  expect(renameInferred.source.resources).toMatch(/mechanical/);
+  // Real behavior/UI android still gets the emulator.
+  const behavior = classifyDependencies(
+    { title: "Android onboarding screen", description: "Add an onboarding flow with e2e coverage" },
+    "android-onboarding",
+  );
+  expect(behavior.resources).toEqual(["emulator", "android-sdk-gradle"]);
 });
 
 test("scheduling decision: hard > resource > cap; soft never blocks", async () => {

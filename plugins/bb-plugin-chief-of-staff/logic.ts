@@ -757,9 +757,11 @@ export function operatingRules(plan: WorkerPlan): string[] {
 //   * resource (Resources): serializes only on a shared resource (the Android
 //     emulator + SDK/Gradle, the iOS simulator) with the active feature runs.
 //   * soft (Soft-after): recorded and shown, never blocks.
-// Explicit `Depends-on:` / `Resources:` / `Soft-after:` lines win. Otherwise:
-// Android/mobile/e2e/emulator/device work needs the emulator; backend,
-// admin-web and landing need nothing; anything asserting tunnel traffic
+// Explicit `Depends-on:` / `Resources:` / `Soft-after:` / `Tags:` lines win. Otherwise:
+// Android/mobile/e2e/emulator/device work needs the emulator + android-sdk-gradle;
+// mechanical / applicationId-only / identity-only / rename-only Android (Tags or
+// rename-only brief) needs android-sdk-gradle only — do NOT infer the emulator;
+// backend, admin-web and landing need nothing; anything asserting tunnel traffic
 // hard-depends on the #12 harness (android-e2e-loop). A client's dependency on
 // the ticket that adds its API cannot be guessed reliably: write Depends-on.
 
@@ -788,8 +790,25 @@ function depLine(text: string, key: string): string | null {
 
 const unique = (values: string[]) => values.filter((value, index) => values.indexOf(value) === index);
 
+/** Mechanical / identity-only Android: rename applicationId/namespace/package, no UX change.
+ *  Mirrors feature-delivery MECHANICAL_TAGS + isMechanicalAndroidSignal. When true, CoS must NOT
+ *  infer the emulator — `android-sdk-gradle` alone is enough (unit/lint/assemble smoke). */
+const MECHANICAL_TAGS = ["mechanical", "applicationid-only", "identity-only", "rename-only", "no-ux"];
+
+function isMechanicalAndroidSignal(text: string): boolean {
+  const t = String(text || "");
+  if (MECHANICAL_TAGS.some((tag) => new RegExp("(^|[^a-z0-9-])" + tag.replace(/-/g, "[-_]?") + "([^a-z0-9-]|$)", "i").test(t))) {
+    return true;
+  }
+  if (/\b(mechanical|identity[- _]?only|rename[- _]?only|applicationid[- _]?only|no[- _]?ux)\b/i.test(t)) return true;
+  if (/\b(application\s*id|applicationid|package(?:\s*name)?|namespace)\b[^.\n]{0,100}\b(rename|renaming|only)\b/i.test(t)) return true;
+  if (/\b(rename|renaming)\b[^.\n]{0,100}\b(application\s*id|applicationid|package(?:\s*name)?|namespace)\b/i.test(t)) return true;
+  if (/\bno\s+(?:ux|ui|user[- ]facing|behavior|behaviour)\s+change/i.test(t)) return true;
+  return false;
+}
+
 /** The three dependency layers of a task (explicit lines first, then conservative inference). */
-const DEP_LINES = /^[\s>*_`#-]*(depends[- ]on|resources|soft[- ]after)[*_`]*\s*:.*$/gim;
+const DEP_LINES = /^[\s>*_`#-]*(depends[- ]on|resources|soft[- ]after|tags)[*_`]*\s*:.*$/gim;
 
 export function classifyDependencies(
   task: Pick<VikunjaTask, "title" | "description">,
@@ -798,14 +817,25 @@ export function classifyDependencies(
   const text = `${task.title}\n\n${plainDescription(task.description)}`;
   const self = feature ?? "";
   const source = { dependsOn: "", resources: "", softAfter: "" };
-  // Inference never reads the dependency lines themselves ("Soft-after:
-  // android-e2e-loop" does not make a backend task need the emulator).
+  // Inference never reads the dependency / Tags lines themselves ("Soft-after:
+  // android-e2e-loop" does not make a backend task need the emulator; "Tags: mechanical"
+  // is read via briefTags below, not as prose).
   const prose = text.replace(DEP_LINES, "");
+  const tagsLine = depLine(text, "tags");
+  const tags = tagsLine === null ? [] : depSlugs(tagsLine);
+  const mechanical =
+    tags.some((t) => MECHANICAL_TAGS.indexOf(t) !== -1) || isMechanicalAndroidSignal(prose);
   let resources: string[];
   const resourceLine = depLine(text, "resources");
   if (resourceLine !== null) {
     resources = depSlugs(resourceLine);
     source.resources = "explicit Resources line";
+  } else if (
+    mechanical &&
+    /\b(android|mobile|application\s*id|applicationid|package|namespace)\b/i.test(prose + " " + tags.join(" "))
+  ) {
+    resources = ["android-sdk-gradle"];
+    source.resources = "inferred: mechanical/rename android needs android-sdk-gradle only (no emulator)";
   } else if (/\b(android|ios|mobile|e2e|emulator|simulator|device)\b/i.test(prose)) {
     resources =
       /\b(ios|simulator)\b/i.test(prose) && !/\b(android|emulator)\b/i.test(prose)
