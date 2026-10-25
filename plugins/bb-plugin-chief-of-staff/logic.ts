@@ -824,6 +824,10 @@ const unique = (values: string[]) => values.filter((value, index) => values.inde
  *  infer the emulator — `android-sdk-gradle` alone is enough (unit/lint/assemble smoke). */
 const MECHANICAL_TAGS = ["mechanical", "applicationid-only", "identity-only", "rename-only", "no-ux"];
 
+/** B: max fresh feature-delivery Spec launches per Vikunja ticket / lease key (mirrors
+ *  rateyourfood feature-delivery.js MAX_SPEC_ROUNDS). continueRepair does not count. */
+export const MAX_SPEC_ROUNDS = 3;
+
 function isMechanicalAndroidSignal(text: string): boolean {
   const t = String(text || "");
   if (MECHANICAL_TAGS.some((tag) => new RegExp("(^|[^a-z0-9-])" + tag.replace(/-/g, "[-_]?") + "([^a-z0-9-]|$)", "i").test(t))) {
@@ -977,6 +981,9 @@ export function featureArgs(task: Pick<VikunjaTask, "id" | "title" | "descriptio
     dependsOn: deps.dependsOn,
     resources: deps.resources,
     softAfter: deps.softAfter,
+    // Codex cost savings A–E: first dispatch is Spec round 1. Driver bumps only on a true fresh Spec
+    // (not continueRepair). Cap: MAX_SPEC_ROUNDS.
+    specRound: 1,
   };
 }
 
@@ -1008,11 +1015,14 @@ export function buildWorkerPrompt(
       `   COS_ARGS_EOF`,
       `3. From this thread's workspace root run: bb workflows run --name ${plan.workflowName} --args "$(cat ${argsFile})"`,
       `   Report "progress" with the run id (workflowRunId). The workflow notifies this thread when it finishes; check with \`bb workflows status <run-id>\` whenever you are woken or nudged, and report "progress" with the run's current phase in the phase field (Queue, Spec, Contract, Approval, Build, Verify, Merge, Deliver; "repair" when Verify sent it back to Build) — the kanban card follows it. Phase "Queue" / "queued behind <run id>" means the run waits for a lease (a shared resource such as the emulator, a free slot under the parallel-run cap, or a hard dependency merging to main): that is normal, keep waiting; never stop, restart or re-run it. Other feature runs may be active at the same time; never touch their worktrees, containers or the emulator.`,
-      `4. When the run finishes, read its result (bb workflows status <run-id>; the result has status, nextAction, report):`,
-      `   - nextAction "approve": the spec flagged irreversible/high-impact work. Call chief_of_staff_ask with kind "irreversible", the result's approvalReasons and report as context, options ["Approve", "Revise: <notes>", "Cancel"]. Approve → re-run with the SAME args plus "approved": true and --resume <run-id> (write ${argsFile.replace(".json", "-approved.json")} once from the frozen file with approved:true added). Revise → a new run whose brief is the frozen brief plus the notes. Cancel → report "failed" with "cancelled by Denis".`,
+      `4. When the run finishes, read its result (bb workflows status <run-id>; the result has status, nextAction, report, repairIssues, specRound):`,
+      `   - nextAction "approve": the spec flagged irreversible/high-impact work. Call chief_of_staff_ask with kind "irreversible", the result's approvalReasons and report as context, options ["Approve", "Revise: <notes>", "Cancel"]. Approve → re-run with the SAME args plus "approved": true and --resume <run-id> (write ${argsFile.replace(".json", "-approved.json")} once from the frozen file with approved:true added). Revise → a new run whose brief is the frozen brief plus the notes (this IS a fresh Spec: bump specRound by 1, omit continueRepair; if the new specRound would exceed MAX_SPEC_ROUNDS (3), do NOT Spec — report blocked with remaining reasons and ask Denis). Cancel → report "failed" with "cancelled by Denis".`,
       `   - status "${plan.deployRequested ? "delivered" : "merged-to-main"}": report "done" with workflowRunId and workflowStatus.`,
-      `   - status "queue-timeout" (nextAction "rerun"): nothing was started; start ONE fresh run with the same frozen args.`,
-      `   - anything else (partial, main-merge-failed, contract-failed, deliver-failed, ...): report "blocked" with the result's report, then chief_of_staff_ask (routine) whether to start a fresh run, hand it to Denis, or cancel.`,
+      `   - status "queue-timeout" (nextAction "rerun"): nothing was started; start ONE fresh run with the same frozen args (same specRound).`,
+      `   - nextAction "continue-repair" (or status "partial" with repairIssues): DO NOT launch a fresh Spec and DO NOT stuff findings into a new brief. Write ${argsFile.replace(".json", "-continue.json")} from the frozen args plus continueRepair:true, repairIssues from the result (map of app -> finding strings), and the SAME specRound; run bb workflows run --name ${plan.workflowName} --args "$(cat that file)". Resume repair→verify→review on the existing branch.`,
+      `   - status "spec-rounds-exhausted" (nextAction "pause"): already used 3 fresh Spec launches for this ticket. Report "blocked", surface remaining MAJORs (result.report + repairIssues) in a Vikunja comment / chief_of_staff_ask; do NOT burn another Spec. Options: continueRepair on the existing branch if findings are repairable, hand to Denis, or cancel.`,
+      `   - Fresh Spec only on: first attempt, true scope change (Denis revise notes / explicit new scope), or explicit new ticket. When you must Spec again (not continue-repair): bump specRound by 1 in a new args file (omit continueRepair/repairIssues). If new specRound > 3, pause as above instead.`,
+      `   - anything else (partial without repairIssues, main-merge-failed, contract-failed, deliver-failed, fix-lane legacy, ...): report "blocked" with the result's report, then chief_of_staff_ask (routine) whether to continue-repair (preferred when review findings remain), start a fresh Spec (bump specRound), hand it to Denis, or cancel.`,
       "",
       "Operating rules:",
       ...operatingRules(plan),

@@ -1,11 +1,14 @@
 import { expect, test } from "vitest";
 import {
   bucketForColumn,
+  buildWorkerPrompt,
   classifyQuestion,
   classifyTask,
   columnForPhase,
   deployIntent,
   FEATURE_SLUG_MAX,
+  featureArgs,
+  MAX_SPEC_ROUNDS,
   parseBuckets,
   phaseFromNote,
   slugFeature,
@@ -269,4 +272,30 @@ test("heavy-device group: ios-simulator never runs alongside emulator / android-
   expect(ios.reason).toContain("ios-simulator conflicts with emulator in use by #28");
   // Backend work still runs beside the simulator.
   expect(schedulingDecision({ deps: deps([]), active: iosRun, maxFeatureRuns: 3, depDone: () => true }).eligible).toBe(true);
+});
+
+test("featureArgs includes specRound 1; MAX_SPEC_ROUNDS is 3", () => {
+  expect(MAX_SPEC_ROUNDS).toBe(3);
+  const args = featureArgs(
+    { id: 13, title: "Backend scaffold", description: "Resources: none\nDepends-on: none" },
+    { feature: "backend-scaffold", deployRequested: false },
+  );
+  expect(args.specRound).toBe(1);
+  expect(args.feature).toBe("backend-scaffold");
+  expect(args.vikunjaTask).toBe(13);
+});
+
+test("buildWorkerPrompt: continue-repair / spec-rounds-exhausted / no fresh Spec stuffing", () => {
+  const prompt = buildWorkerPrompt(
+    { id: 13, title: "Backend scaffold", description: "Resources: none" },
+    { mode: "feature", feature: "backend-scaffold", deployRequested: false, workflowName: "feature-delivery" },
+  );
+  expect(prompt).toMatch(/continue-repair/);
+  expect(prompt).toMatch(/continueRepair:true/);
+  expect(prompt).toMatch(/spec-rounds-exhausted/);
+  expect(prompt).toMatch(/DO NOT launch a fresh Spec/);
+  expect(prompt).toMatch(/DO NOT stuff findings into a new brief/);
+  expect(prompt).toMatch(/bump specRound by 1/);
+  expect(prompt).toMatch(/SAME specRound/);
+  expect(prompt).toContain('"specRound":1');
 });

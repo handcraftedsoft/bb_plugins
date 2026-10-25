@@ -93,3 +93,5 @@ Operating constraints:
   reading DNS/certs and estimating cost are routine; genuinely ambiguous DNS,
   cert or money questions escalate. Phrase questions plainly, one action per
   sentence.
+
+Codex cost savings (A–E): on `nextAction=continue-repair` / partial with `repairIssues`, re-run with `continueRepair:true` + same `specRound` (no fresh Spec). Fresh Spec only on first attempt, true scope change, or new ticket; cap `MAX_SPEC_ROUNDS=3` then pause. Mechanical/identity tickets skip early/final Codex review inside the workflow.
