@@ -94,4 +94,4 @@ Operating constraints:
   cert or money questions escalate. Phrase questions plainly, one action per
   sentence.
 
-Codex cost savings (A–E): on `nextAction=continue-repair` / partial with `repairIssues`, re-run with `continueRepair:true` + same `specRound` (no fresh Spec). Fresh Spec only on first attempt, true scope change, or new ticket; cap `MAX_SPEC_ROUNDS=3` then pause. Mechanical/identity tickets skip early/final Codex review inside the workflow.
+Codex cost savings (A–E + A+): on `nextAction=continue-repair` / partial with `repairIssues` / **main-merge conflict** (`mergeConflict` / `mergeConflictRepair`), re-run with `continueRepair:true` + same `specRound` (and mergeConflict fields when present) — no fresh Spec. Fresh Spec only on first attempt, true scope change, or new ticket; never solely for a merge conflict; cap `MAX_SPEC_ROUNDS=3` then pause. Mechanical/identity tickets skip early/final Codex review inside the workflow.

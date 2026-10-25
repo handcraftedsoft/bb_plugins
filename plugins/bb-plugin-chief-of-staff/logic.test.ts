@@ -298,4 +298,8 @@ test("buildWorkerPrompt: continue-repair / spec-rounds-exhausted / no fresh Spec
   expect(prompt).toMatch(/bump specRound by 1/);
   expect(prompt).toMatch(/SAME specRound/);
   expect(prompt).toContain('"specRound":1');
+  // A+: main-merge conflict uses continue-repair / mergeConflictRepair — never fresh Spec alone
+  expect(prompt).toMatch(/mergeConflictRepair:true/);
+  expect(prompt).toMatch(/main-merge-failed/);
+  expect(prompt).toMatch(/NEVER start a fresh Spec solely because of a main merge conflict/);
 });
