@@ -4,6 +4,9 @@
 // composes briefings. Vikunja access goes through the vikunja plugin's RPC
 // (call / links / link / buckets / move / status) via bb.sdk.plugins.callRpc.
 import { execFile } from "node:child_process";
+import { readdir, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import {
@@ -22,6 +25,7 @@ import {
   describeAnswer,
   describeDeps,
   schedulingDecision,
+  KNOWN_RESOURCES,
   type TaskDeps,
   featureDoneAllowed,
   operatingRules,
@@ -111,11 +115,39 @@ function featureMerged(repo: string, slug: string): Promise<boolean> {
   });
 }
 
-/** Test seams: existing branch/worktree names; whether a feature is merged to main. */
+/** Resources a workflow run's live lease holds (feature-delivery lock helper:
+ * ~/.bb/locks/<lock>.leases/<run-id>.json), or null when it holds none / no lease. */
+async function leaseResources(runId: string): Promise<string[] | null> {
+  const dir = join(homedir(), ".bb", "locks");
+  const file = runId.replace(/[^A-Za-z0-9_.:-]/g, "_") + ".json";
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return null;
+  }
+  for (const entry of entries.filter((name) => name.endsWith(".leases"))) {
+    try {
+      const lease = JSON.parse(await readFile(join(dir, entry, file), "utf8")) as { resources?: unknown };
+      if (Array.isArray(lease.resources)) return lease.resources.filter((item): item is string => typeof item === "string");
+    } catch {
+      // no lease for this run under this lock
+    }
+  }
+  return null;
+}
+
+/** Test seams: existing branch/worktree names; whether a feature is merged to main;
+ * the resources a workflow run's live lease holds. */
 export const runtimeHooks: {
   gitNames: (repo: string) => Promise<string[]>;
   featureMerged: (repo: string, slug: string) => Promise<boolean>;
-} = { gitNames, featureMerged };
+  leaseResources: (runId: string) => Promise<string[] | null>;
+} = { gitNames, featureMerged, leaseResources };
+
+/** Error prefix for a paused feature task that keeps its worker thread but is
+ * held back by the scheduler (resource / cap); the sweep resumes it when eligible. */
+export const SCHEDULER_HOLD = "held by scheduler: ";
 
 export interface TaskView {
   taskId: number;
@@ -332,6 +364,69 @@ export class ChiefOfStaff {
       taskForFeature: (slug) => this.store.featureTask(slug)?.taskId ?? null,
     });
     return { deps, decision };
+  }
+
+  /** Record resources a running feature task's workflow lease actually holds
+   * (e.g. ios-simulator on a ticket that said "Resources: none"), so scheduling
+   * and status see them. Only ever adds resources. */
+  private async recordLeaseResources(): Promise<void> {
+    for (const run of this.store.activeFeatureRuns()) {
+      const meta = this.store.getTaskMeta(run.taskId);
+      const runId = meta?.workflowRunId ?? null;
+      if (runId === null) continue;
+      let held: string[] | null = null;
+      try {
+        held = await runtimeHooks.leaseResources(runId);
+      } catch {
+        held = null;
+      }
+      this.addHeldResources(run.taskId, held ?? [], `held by workflow lease ${runId}`);
+    }
+  }
+
+  /** Operator override (`bb chief resources`): record resources a feature task
+   * really needs when its ticket's Resources line is wrong. Adds only. */
+  addTaskResources(taskId: number, resources: string[]): TaskDeps {
+    if (this.store.getTaskMeta(taskId)?.mode !== "feature") throw new Error(`Task #${taskId} is not a feature task`);
+    const unknown = resources.filter((resource) => !KNOWN_RESOURCES.includes(resource));
+    if (unknown.length > 0) throw new Error(`unknown resource: ${unknown.join(", ")} (known: ${KNOWN_RESOURCES.join(", ")})`);
+    if (this.store.getSchedule(taskId).deps === null) {
+      this.store.setSchedule(taskId, {
+        deps: { dependsOn: [], resources: [], softAfter: [], source: { dependsOn: "", resources: "", softAfter: "" } },
+      });
+    }
+    this.addHeldResources(taskId, resources, "set by operator");
+    this.publish();
+    return this.store.getSchedule(taskId).deps!;
+  }
+
+  /** Add resources a task's workflow run actually held to its recorded deps (never removes). */
+  private addHeldResources(taskId: number, held: string[], why: string): void {
+    const deps = this.store.getSchedule(taskId).deps;
+    if (deps === null) return;
+    const extra = [...new Set(held)].filter((resource) => !deps.resources.includes(resource));
+    if (extra.length === 0) return;
+    this.store.setSchedule(taskId, {
+      deps: {
+        ...deps,
+        resources: [...deps.resources, ...extra],
+        source: { ...deps.source, resources: `${deps.source.resources} + ${why}` },
+      },
+    });
+    this.bb.log.info(`task ${taskId}: ${extra.join(", ")} ${why}; recorded`);
+  }
+
+  /** Scheduling for a task that already has a worker thread (frozen deps):
+   * its hard deps were met at dispatch, so only resources and the cap count. */
+  private scheduleHeld(taskId: number, settings: CosSettings) {
+    const deps = this.store.getSchedule(taskId).deps;
+    if (deps === null) return { eligible: true, layer: null, reason: null } as const;
+    return schedulingDecision({
+      deps: { ...deps, dependsOn: [] },
+      active: this.store.activeFeatureRuns().filter((run) => run.taskId !== taskId),
+      maxFeatureRuns: settings.maxFeatureRuns,
+      depDone: () => true,
+    });
   }
 
   /** Local checkout of the BB project (default local_path source), if any. */
@@ -583,18 +678,23 @@ export class ChiefOfStaff {
         `links for task ${task.id}: ${cause instanceof Error ? cause.message : String(cause)}`,
       );
     }
-    for (const candidate of [...links].reverse()) {
-      const alive = await this.threadAlive(candidate);
-      if (alive === null || alive.archivedAt !== null) continue;
-      await this.adoptTask(task, candidate, now, settings);
-      await this.moveTaskToDoing(task);
-      return;
+    // Feature tasks are scheduled before anything runs, adopted threads included
+    // (an adopted driver would otherwise relaunch its run beside a conflicting one).
+    const meta = await this.metaFor(task, settings);
+    const scheduled = meta.mode === "feature" ? await this.scheduleFeature(task, meta, settings) : null;
+    if (scheduled === null || scheduled.decision.eligible) {
+      for (const candidate of [...links].reverse()) {
+        const alive = await this.threadAlive(candidate);
+        if (alive === null || alive.archivedAt !== null) continue;
+        await this.adoptTask(task, candidate, now, settings);
+        if (scheduled !== null) this.store.setSchedule(task.id, { deps: scheduled.deps, blockReason: null });
+        await this.moveTaskToDoing(task);
+        return;
+      }
     }
     // No reusable thread: spawn a fresh worker, within the concurrency budget.
-    const meta = await this.metaFor(task, settings);
     let deps: TaskDeps | null = null;
-    if (meta.mode === "feature") {
-      const scheduled = await this.scheduleFeature(task, meta, settings);
+    if (scheduled !== null) {
       deps = scheduled.deps;
       if (!scheduled.decision.eligible) {
         const reason = scheduled.decision.reason!;
@@ -1093,11 +1193,54 @@ export class ChiefOfStaff {
     return updated;
   }
 
+  /** A feature driver held back by the scheduler continues once its resources are free. */
+  private async resumeIfEligible(taskId: number, threadId: string, settings: CosSettings): Promise<void> {
+    const decision = this.scheduleHeld(taskId, settings);
+    if (!decision.eligible) {
+      if (this.store.getSchedule(taskId).blockReason !== decision.reason) {
+        this.store.setSchedule(taskId, { blockReason: decision.reason });
+        this.store.updateTask(taskId, { error: SCHEDULER_HOLD + decision.reason! });
+      }
+      return;
+    }
+    const alive = await this.threadAlive(threadId);
+    if (alive === null || alive.archivedAt !== null) {
+      this.store.updateTask(taskId, { threadId: null, state: "paused", error: "worker thread is gone" });
+      return;
+    }
+    await this.sendToThread(
+      threadId,
+      "The resources this task needs are free now (the Chief of Staff held it back while a conflicting run used the device). Continue now: check your workflow run with `bb workflows status`; if it is not running, launch ONE fresh run, and report 'progress' with its run id.",
+    );
+    this.store.setSchedule(taskId, { blockReason: null });
+    this.store.updateTask(taskId, {
+      state: "active",
+      progressNote: "resumed by scheduler (resources free)",
+      progressAt: Date.now(),
+      stalled: 0,
+      nudgeCount: 0,
+      error: null,
+    });
+  }
+
   async resumeTask(taskId: number): Promise<TaskRow | null> {
     const task = this.store.getTask(taskId);
     if (task === null) return null;
     if (task.state !== "paused") throw new Error(`Task #${taskId} is ${task.state}; only paused tasks can resume`);
     if (task.threadId !== null && (await this.threadAlive(task.threadId)) !== null) {
+      if (this.store.getTaskMeta(taskId)?.mode === "feature") {
+        // Never resume a feature driver beside a run holding its (or a conflicting) resource.
+        await this.recordLeaseResources();
+        const decision = this.scheduleHeld(taskId, await this.readSettings());
+        if (!decision.eligible) {
+          const updated = this.store.updateTask(taskId, { error: SCHEDULER_HOLD + decision.reason! })!;
+          this.store.setSchedule(taskId, { blockReason: decision.reason });
+          await this.refreshBriefing();
+          this.publish();
+          return updated;
+        }
+        this.store.setSchedule(taskId, { blockReason: null });
+      }
       await this.sendToThread(
         task.threadId,
         "The user resumed this task. Continue working on it now, starting with a chief_of_staff_report stage 'progress' note on where you left off.",
@@ -1205,6 +1348,7 @@ export class ChiefOfStaff {
           this.depsFor(task, meta);
         }
       }
+      await this.recordLeaseResources();
 
       for (const task of tasks) {
         const row = this.store.getTask(task.id);
@@ -1222,6 +1366,7 @@ export class ChiefOfStaff {
         }
         if (row.state === "paused") {
           this.store.updateTask(task.id, { lastTaskUpdated: task.updated });
+          if (row.error?.startsWith(SCHEDULER_HOLD)) await this.resumeIfEligible(task.id, row.threadId, settings);
           continue;
         }
         if (row.state === "closed") {

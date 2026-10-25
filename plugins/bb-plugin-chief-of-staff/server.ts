@@ -505,6 +505,29 @@ export default async function plugin(bb: BbPluginApi) {
         }),
         pause: taskCommand("pause", "Pause a task's worker (stops the thread)"),
         resume: taskCommand("resume", "Resume a paused task"),
+        resources: cliCommand({
+          summary:
+            "Record shared resources a feature task really uses (adds to its recorded deps, e.g. ios-simulator when the ticket says Resources: none); scheduling serializes on them and on heavy-device conflicts",
+          positionals: [
+            { name: "task", description: "Vikunja task id, e.g. 35", required: true },
+            { name: "resources", description: "Comma-separated: emulator, android-sdk-gradle, ios-simulator", required: true },
+          ],
+          options: { json: { type: "boolean", description: "Emit machine-readable JSON" } },
+          async run(input) {
+            const task = requireTask(input.positionals.task);
+            const wanted = String(input.positionals.resources)
+              .split(/[,\s]+/u)
+              .map((entry) => entry.trim().toLowerCase())
+              .filter((entry) => entry !== "");
+            let deps;
+            try {
+              deps = chief.addTaskResources(task.taskId, wanted);
+            } catch (cause) {
+              throw new PluginCliError(cause instanceof Error ? cause.message : String(cause), { code: "bad_resources" });
+            }
+            return reply(input.options.json, { taskId: task.taskId, deps }, `#${task.taskId} resources: ${deps.resources.join(", ") || "none"}`);
+          },
+        }),
         decisions: cliCommand({
           summary: "List decisions, pending first",
           options: { json: { type: "boolean", description: "Emit machine-readable JSON" } },

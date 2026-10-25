@@ -756,8 +756,12 @@ export function operatingRules(plan: WorkerPlan): string[] {
 //     feature/<slug> merged / a `feature: <slug>` commit on main).
 //   * resource (Resources): serializes only on a shared resource (the Android
 //     emulator + SDK/Gradle, the iOS simulator) with the active feature runs.
+//     Heavy-device group: the iOS simulator conflicts with the Android emulator
+//     and android-sdk-gradle (one Mac cannot boot both without load spikes that
+//     kill workers), so they serialize like one resource.
 //   * soft (Soft-after): recorded and shown, never blocks.
 // Explicit `Depends-on:` / `Resources:` / `Soft-after:` / `Tags:` lines win. Otherwise:
+// iOS/Xcode/simulator-only work needs ios-simulator;
 // Android/mobile/e2e/emulator/device work needs the emulator + android-sdk-gradle;
 // mechanical / applicationId-only / identity-only / rename-only Android (Tags or
 // rename-only brief) needs android-sdk-gradle only — do NOT infer the emulator;
@@ -766,6 +770,21 @@ export function operatingRules(plan: WorkerPlan): string[] {
 // the ticket that adds its API cannot be guessed reliably: write Depends-on.
 
 export const TUNNEL_HARNESS = "android-e2e-loop";
+
+/** Resources that never run together besides the same resource (symmetric):
+ * the heavy-device group. Mirrors FDL_RESOURCE_CONFLICTS in the rateyourfood
+ * feature-delivery lock helper. */
+export const RESOURCE_CONFLICTS: Record<string, readonly string[]> = {
+  "ios-simulator": ["emulator", "android-sdk-gradle"],
+};
+
+/** Shared resources the feature-delivery workflow leases (APP_RESOURCES there). */
+export const KNOWN_RESOURCES: readonly string[] = ["emulator", "android-sdk-gradle", "ios-simulator"];
+
+/** Same resource, or a heavy-device-group conflict (either direction). */
+export function resourcesConflict(a: string, b: string): boolean {
+  return a === b || (RESOURCE_CONFLICTS[a]?.includes(b) ?? false) || (RESOURCE_CONFLICTS[b]?.includes(a) ?? false);
+}
 
 export interface TaskDeps {
   dependsOn: string[];
@@ -836,12 +855,12 @@ export function classifyDependencies(
   ) {
     resources = ["android-sdk-gradle"];
     source.resources = "inferred: mechanical/rename android needs android-sdk-gradle only (no emulator)";
-  } else if (/\b(android|ios|mobile|e2e|emulator|simulator|device)\b/i.test(prose)) {
-    resources =
-      /\b(ios|simulator)\b/i.test(prose) && !/\b(android|emulator)\b/i.test(prose)
-        ? ["ios-simulator"]
-        : ["emulator", "android-sdk-gradle", ...(/\bios\b/i.test(prose) ? ["ios-simulator"] : [])];
-    source.resources = "inferred: mobile/e2e work needs the emulator";
+  } else if (/\b(android|ios|xcode|mobile|e2e|emulator|simulator|device)\b/i.test(prose)) {
+    const iosOnly = /\b(ios|xcode|simulator)\b/i.test(prose) && !/\b(android|emulator)\b/i.test(prose);
+    resources = iosOnly
+      ? ["ios-simulator"]
+      : ["emulator", "android-sdk-gradle", ...(/\b(ios|xcode)\b/i.test(prose) ? ["ios-simulator"] : [])];
+    source.resources = iosOnly ? "inferred: iOS/Xcode/simulator work needs the iOS simulator" : "inferred: mobile/e2e work needs the emulator";
   } else {
     resources = [];
     source.resources = "inferred: backend/web work needs no shared resource";
@@ -909,12 +928,19 @@ export function schedulingDecision(input: SchedulingInput): SchedulingDecision {
     return { eligible: false, layer: "hard", reason: `hard dependency: waiting for ${named.join(", ")} to merge to main` };
   }
   for (const resource of input.deps.resources) {
-    const holder = input.active.find((run) => run.resources.includes(resource));
+    const holder =
+      input.active.find((run) => run.resources.includes(resource)) ??
+      input.active.find((run) => run.resources.some((held) => resourcesConflict(resource, held)));
     if (holder !== undefined) {
+      const who = `#${holder.taskId}${holder.feature === null ? "" : ` (${holder.feature})`}`;
+      if (holder.resources.includes(resource)) {
+        return { eligible: false, layer: "resource", reason: `resource: ${resource} is in use by ${who}` };
+      }
+      const held = holder.resources.find((entry) => resourcesConflict(resource, entry))!;
       return {
         eligible: false,
         layer: "resource",
-        reason: `resource: ${resource} is in use by #${holder.taskId}${holder.feature === null ? "" : ` (${holder.feature})`}`,
+        reason: `resource: ${resource} conflicts with ${held} in use by ${who} (heavy-device group: iOS simulator and Android emulator/Gradle never run together)`,
       };
     }
   }

@@ -232,3 +232,39 @@ test("scheduling decision: hard > resource > cap; soft never blocks", async () =
   const full = [1, 2, 3].map((taskId) => ({ taskId, feature: null, resources: [] }));
   expect(schedulingDecision({ deps: deps({}), active: full, maxFeatureRuns: 3, depDone: () => true })).toMatchObject({ layer: "cap" });
 });
+
+test("heavy-device group: ios-simulator never runs alongside emulator / android-sdk-gradle; Xcode tickets get ios-simulator", async () => {
+  const { schedulingDecision, classifyDependencies, resourcesConflict } = await import("./logic");
+  expect(resourcesConflict("ios-simulator", "emulator")).toBe(true);
+  expect(resourcesConflict("emulator", "ios-simulator")).toBe(true);
+  expect(resourcesConflict("ios-simulator", "android-sdk-gradle")).toBe(true);
+  expect(resourcesConflict("android-sdk-gradle", "ios-simulator")).toBe(true);
+  expect(resourcesConflict("emulator", "emulator")).toBe(true);
+  expect(resourcesConflict("emulator", "android-sdk-gradle")).toBe(false);
+  expect(resourcesConflict("ios-simulator", "postgres")).toBe(false);
+  // Inference: iOS / Xcode / simulator tickets need the iOS simulator.
+  const xcode = classifyDependencies({ title: "Mac mini: install Xcode and runtimes", description: "" }, "xcode-setup");
+  expect(xcode.resources).toEqual(["ios-simulator"]);
+  const sim = classifyDependencies({ title: "Simulator smoke for the app", description: "" }, "sim-smoke");
+  expect(sim.resources).toEqual(["ios-simulator"]);
+  // Explicit Resources lines still win.
+  expect(classifyDependencies({ title: "Xcode setup", description: "Resources: none" }, "x").resources).toEqual([]);
+  const deps = (resources: string[]) => ({
+    dependsOn: [],
+    resources,
+    softAfter: [],
+    source: { dependsOn: "", resources: "", softAfter: "" },
+  });
+  const iosRun = [{ taskId: 35, feature: "ios-mac-mini-env-setup", resources: ["ios-simulator"] }];
+  const android = schedulingDecision({ deps: deps(["emulator", "android-sdk-gradle"]), active: iosRun, maxFeatureRuns: 3, depDone: () => true });
+  expect(android).toMatchObject({ eligible: false, layer: "resource" });
+  expect(android.reason).toContain("resource: emulator conflicts with ios-simulator in use by #35 (ios-mac-mini-env-setup)");
+  const gradleOnly = schedulingDecision({ deps: deps(["android-sdk-gradle"]), active: iosRun, maxFeatureRuns: 3, depDone: () => true });
+  expect(gradleOnly).toMatchObject({ eligible: false, layer: "resource" });
+  const androidRun = [{ taskId: 28, feature: "android-package-rename", resources: ["emulator", "android-sdk-gradle"] }];
+  const ios = schedulingDecision({ deps: deps(["ios-simulator"]), active: androidRun, maxFeatureRuns: 3, depDone: () => true });
+  expect(ios).toMatchObject({ eligible: false, layer: "resource" });
+  expect(ios.reason).toContain("ios-simulator conflicts with emulator in use by #28");
+  // Backend work still runs beside the simulator.
+  expect(schedulingDecision({ deps: deps([]), active: iosRun, maxFeatureRuns: 3, depDone: () => true }).eligible).toBe(true);
+});

@@ -13,6 +13,9 @@ let gitNamesInRepo: string[] = [];
 runtimeHooks.gitNames = async () => gitNamesInRepo;
 let mergedFeatures: string[] = [];
 runtimeHooks.featureMerged = async (_repo, slug) => mergedFeatures.includes(slug);
+/** Resources held by a workflow run's live lease (feature-delivery lock helper). */
+let leaseByRun: Record<string, string[]> = {};
+runtimeHooks.leaseResources = async (runId) => leaseByRun[runId] ?? null;
 
 interface FakeTask {
   id: number;
@@ -1206,6 +1209,110 @@ test("dependency layers: backend runs beside Android, same resource and hard dep
     expect(byId(42).state).toBe("paused");
   } finally {
     mergedFeatures = [];
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("heavy-device group: a live ios-simulator lease is recorded; resuming an Android task waits for it, then auto-resumes", async () => {
+  leaseByRun = {};
+  const fake: FakeVikunja = {
+    tasks: [
+      { id: 70, title: "Mac mini: iOS dev environment", description: "feature: ios-env<br>Resources: none", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+      { id: 71, title: "Rename Android package", description: "feature: android-rename<br>Resources: emulator, android-sdk-gradle", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+    ],
+    runs: { th_w1: [{ id: "wfr_ios", status: "running", currentPhase: "Build" }] },
+  };
+  const { harness } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4 });
+  try {
+    await syncNow(harness);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    // #70's run takes the iOS simulator lease although its ticket says "Resources: none".
+    await report(harness, { stage: "progress", note: "launched", workflowRunId: "wfr_ios", workflowStatus: "running" }, "th_w1");
+    leaseByRun = { wfr_ios: ["ios-simulator"] };
+    await syncNow(harness);
+    let overview = await harness.behavior.callRpc("overview", null);
+    const byId = (id: number) => overview.tasks.find((entry) => entry.taskId === id)!;
+    expect(byId(70).resources).toEqual(["ios-simulator"]);
+    let listing = await harness.behavior.runCli(["tasks"]);
+    expect(listing.stdout).toContain("ios-simulator");
+    // The Android task is paused (its run stopped) and resumed: it must wait.
+    await harness.behavior.runCli(["pause", "71"]);
+    const sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["resume", "71"]);
+    overview = await harness.behavior.callRpc("overview", null);
+    expect(byId(71).state).toBe("paused");
+    expect(byId(71).blockReason).toContain("emulator conflicts with ios-simulator in use by #70");
+    expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(sendsBefore);
+    listing = await harness.behavior.runCli(["tasks"]);
+    expect(listing.stdout).toContain("conflicts with ios-simulator in use by #70");
+    // Still held while #70 runs.
+    await syncNow(harness);
+    overview = await harness.behavior.callRpc("overview", null);
+    expect(byId(71).state).toBe("paused");
+    // #70 finishes: the Android worker is told to continue (one fresh run).
+    leaseByRun = {};
+    fake.tasks[0]!.done = true;
+    await syncNow(harness);
+    overview = await harness.behavior.callRpc("overview", null);
+    expect(byId(71).state).toBe("active");
+    expect(byId(71).blockReason).toBeNull();
+    const sends = harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore).map((call) => call[0] as { threadId: string });
+    expect(sends.filter((send) => send.threadId === "th_w2")).toHaveLength(1);
+  } finally {
+    leaseByRun = {};
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("heavy-device group: a linked (adopted) thread is not resumed while a conflicting run holds the device", async () => {
+  leaseByRun = {};
+  const fake: FakeVikunja = {
+    tasks: [
+      { id: 72, title: "iOS simulator smoke", description: "feature: ios-smoke", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+    ],
+  };
+  const { harness } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4 });
+  try {
+    await syncNow(harness);
+    fake.tasks.push({ id: 73, title: "Android rename", description: "feature: android-rename-2<br>Resources: emulator, android-sdk-gradle", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 });
+    fake.links = { 73: ["th_old"] };
+    await syncNow(harness);
+    const overview = await harness.behavior.callRpc("overview", null);
+    const row = overview.tasks.find((entry) => entry.taskId === 73)!;
+    expect(row.state).toBe("paused");
+    expect(row.threadId).toBeNull();
+    expect(row.blockReason).toContain("emulator conflicts with ios-simulator in use by #72");
+  } finally {
+    await harness.lifecycle.dispose();
+  }
+});
+
+test("heavy-device group: `bb chief resources` records a running task's real resources; a resumed Android task then waits", async () => {
+  leaseByRun = {};
+  const fake: FakeVikunja = {
+    tasks: [
+      { id: 75, title: "iOS env", description: "feature: ios-env-3<br>Resources: none", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+      { id: 76, title: "Android rename", description: "feature: android-rename-3<br>Resources: emulator, android-sdk-gradle", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
+    ],
+  };
+  const { harness } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4 });
+  try {
+    await syncNow(harness);
+    await harness.behavior.runCli(["pause", "76"]);
+    const out = await harness.behavior.runCli(["resources", "75", "ios-simulator"]);
+    expect(out.stdout).toContain("#75");
+    expect(out.stdout).toContain("ios-simulator");
+    let overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks.find((entry) => entry.taskId === 75)!.resources).toEqual(["ios-simulator"]);
+    // Unknown resource names are rejected.
+    const bad = await harness.behavior.runCli(["resources", "75", "gpu"]).then((result) => JSON.stringify(result), (cause) => String(cause));
+    expect(bad).toMatch(/unknown resource/);
+    await harness.behavior.runCli(["resume", "76"]);
+    overview = await harness.behavior.callRpc("overview", null);
+    const row = overview.tasks.find((entry) => entry.taskId === 76)!;
+    expect(row.state).toBe("paused");
+    expect(row.blockReason).toContain("emulator conflicts with ios-simulator in use by #75");
+  } finally {
     await harness.lifecycle.dispose();
   }
 });

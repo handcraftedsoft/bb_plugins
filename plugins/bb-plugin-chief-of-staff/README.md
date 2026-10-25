@@ -96,8 +96,17 @@ worker thread:
     finished (`merged-to-main`/`delivered`) or git shows `feature/<slug>` /
     a `feature: <slug>` commit on main;
   - *resource* (`Resources:` line; or inferred: android/mobile/e2e work needs
-    `emulator` + `android-sdk-gradle`; backend/web need none) — serializes
-    only against active runs holding the same resource;
+    `emulator` + `android-sdk-gradle`; iOS/Xcode/simulator work needs
+    `ios-simulator`; backend/web need none) — serializes only against active
+    runs holding the same resource or a conflicting one. Heavy-device group:
+    `ios-simulator` conflicts with `emulator` and `android-sdk-gradle` (one Mac
+    cannot run both). Resources a task's workflow run actually holds (its live
+    lease under `~/.bb/locks/*.leases/`, read every sweep) are added to the
+    task's recorded resources; `bb chief resources <task> <list>` adds them by
+    hand when a ticket's `Resources:` line is wrong. A feature task that keeps its
+    worker thread (resume, adopted Vikunja link) is scheduled too: when blocked
+    it stays paused (`held by scheduler: <reason>`) and the sweep tells the
+    driver to continue once the resources are free;
   - *soft* (`Soft-after:`) — recorded and shown, never blocks.
   Explicit lines win; inference reads the prose only. Up to `maxFeatureRuns`
   (default 3) run at once; everything eligible is dispatched each sweep. A
