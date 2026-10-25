@@ -13,6 +13,7 @@ import {
   phaseFromNote,
   slugFeature,
   workflowPhaseFromTimeline,
+  operatingRules,
 } from "./logic";
 
 const NO = [
@@ -302,4 +303,10 @@ test("buildWorkerPrompt: continue-repair / spec-rounds-exhausted / no fresh Spec
   expect(prompt).toMatch(/mergeConflictRepair:true/);
   expect(prompt).toMatch(/main-merge-failed/);
   expect(prompt).toMatch(/NEVER start a fresh Spec solely because of a main merge conflict/);
+  // A++: manager adoption of process/lane-ownership MAJORs → continue-repair, never fresh Spec
+  expect(prompt).toMatch(/NEVER start a fresh Spec solely because the manager/);
+  expect(prompt).toMatch(/manager adoption/);
+  expect(prompt).toMatch(/ONE FRESH run.*continueRepair/s);
+  expect(prompt).toMatch(/Manager adoption exception/);
+  expect(operatingRules({ mode: "feature", feature: "backend-scaffold", deployRequested: false, workflowName: "feature-delivery" }).join("\n")).toMatch(/continueRepair:true/);
 });
