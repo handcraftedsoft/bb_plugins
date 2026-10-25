@@ -131,7 +131,7 @@ export const BUILTIN_POLICIES: Array<Pick<PolicyRow, "keywords" | "answer">> = [
   {
     keywords: ["merge", "merging", "merged"],
     answer:
-      "Merging into LOCAL main is reversible and expected once everything passes. Feature tasks: feature-delivery does the merge. Plain tasks: once make test-<app> and make lint are green, merge with `git -C <main checkout> merge --no-ff <your branch>` where <main checkout> is the first entry of `git worktree list --porcelain` and must be on main; only if the merge touches no locally modified file there, otherwise report blocked. Never force-push or rewrite history.",
+      "Merging into LOCAL main is reversible and expected once everything passes. Feature tasks: feature-delivery does the merge and then always pushes origin main. Plain tasks: once make test-<app> and make lint are green, merge with `git -C <main checkout> merge --no-ff <your branch>` where <main checkout> is the first entry of `git worktree list --porcelain` and must be on main; only if the merge touches no locally modified file there, otherwise report blocked; then `git -C <main checkout> push origin main` (never force). Never force-push or rewrite history.",
   },
   {
     keywords: ["test", "tests", "testing", "lint"],
@@ -423,8 +423,10 @@ export function classifyTask(
 //     time/effort and code nouns ("purchase flow", "billing page") are routine.
 //   * Production config: changing prod config/env vars/feature flags escalates
 //     even when the task asked for a deploy.
-//   * Deploy/push/release/production: allowed only when the task asked for a
-//     deploy (same verbs as deployIntent); negated mentions do not count.
+//   * Plain git push to origin (after a green merge): always allowed — standing
+//     policy (Denis, Oct 2026). Deploy/release/production/stores: allowed only
+//     when the task asked for a deploy (same verbs as deployIntent); negated
+//     mentions do not count.
 
 const CLAUSE_SPLIT = /[?!;\n]+|\.(?=\s|$)|:(?=\s)|\s*,?\s*\b(?:but|however|although|though|except|unless|whereas)\b\s*/i;
 
@@ -572,9 +574,16 @@ export function triageQuestion(question: string, deployRequested: boolean, decla
     }
   }
   if (deploy) {
+    // Standing policy: a plain `git push origin` (not force) after a green merge
+    // is always allowed. Real deploy/release/prod/store actions still need the
+    // task to have asked for a deploy.
+    const pushOnly = !/\b(?:re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?\b(?!\s+(?:script|docs?|documentation)\b)|publish\w*|releas(?:e|es|ed|ing)\b(?!\s+(?:builds?|variants?|apks?|aabs?|notes|mode|config\w*|signing|types?)\b)|prod|production|go(?:es|ing)?\s+live|app\s+store|play\s+store|testflight)\b/i.test(text);
+    if (pushOnly) {
+      return { class: "deploy-allowed", reason: "push after green merge is standing policy" };
+    }
     return deployRequested
       ? { class: "deploy-allowed", reason: "deploy/push requested by the task" }
-      : { class: "irreversible", reason: "deploy/push not requested by the task" };
+      : { class: "irreversible", reason: "deploy not requested by the task" };
   }
   if (declared === "irreversible") return { class: "irreversible", reason: "declared irreversible by the worker" };
   return { class: "routine", reason: "no irreversible action" };
@@ -588,8 +597,9 @@ export function classifyQuestion(question: string, deployRequested: boolean, dec
 
 export const FINISHED_WORKFLOW_STATUSES = ["merged-to-main", "delivered"] as const;
 
-/** Whether a feature task may close: the workflow merged to local main, and
- * delivered (pushed/deployed) too when the task asked for that. */
+/** Whether a feature task may close: the workflow merged to local main
+ * (Deliver always pushes origin main), and status "delivered" when the task
+ * also asked for a deploy. */
 export function featureDoneAllowed(status: string | null, deployRequested: boolean): boolean {
   if (status === null) return false;
   if (deployRequested) return status === "delivered";
@@ -715,8 +725,8 @@ export interface WorkerPlan {
 
 function deployRule(plan: WorkerPlan): string {
   return plan.deployRequested
-    ? "- Push/deploy: this task EXPLICITLY asks for a push/deploy/release, so it is allowed — but only after everything is merged to local main and all tests pass. Push with a plain `git push origin main` (never force) and use the documented deploy procedure for the affected area only."
-    : "- Push/deploy: this task does NOT ask for a push, deploy, or release, so do none of them. If you believe one is needed, ask with chief_of_staff_ask (kind \"irreversible\") and wait.";
+    ? "- Push/deploy: after a green merge to local main, ALWAYS `git push origin main` (never force) — standing policy. This task ALSO asks for a deploy/release: use the documented deploy procedure for the affected area only, after the push."
+    : "- Push: after a green merge to local main, ALWAYS `git push origin main` (never force) — standing policy (Denis, Oct 2026). Deploy/release to production/staging/stores: this task does NOT ask for one, so do not deploy. If you believe a deploy is needed, ask with chief_of_staff_ask (kind \"irreversible\") and wait.";
 }
 
 const REVERSIBILITY_RULES = [
@@ -735,7 +745,7 @@ export function operatingRules(plan: WorkerPlan): string[] {
   ];
   if (plan.mode === "feature") {
     return [
-      `- This is a FEATURE: it ships through the \`${plan.workflowName}\` bb workflow, not by hand. Do not write app code, create branches, merge, or push yourself; the workflow owns spec, build, verify, merge to local main${plan.deployRequested ? ", and delivery (push/deploy)" : ""}.`,
+      `- This is a FEATURE: it ships through the \`${plan.workflowName}\` bb workflow, not by hand. Do not write app code, create branches, merge, or push yourself; the workflow owns spec, build, verify, merge to local main, push origin main${plan.deployRequested ? ", and deploy" : ""}.`,
       ...common,
       `- "done" is accepted only after the workflow returns status ${plan.deployRequested ? '"delivered"' : '"merged-to-main"'}; pass workflowRunId and workflowStatus in the report.`,
     ];
@@ -743,7 +753,7 @@ export function operatingRules(plan: WorkerPlan): string[] {
   return [
     '- Kanban: report "progress" with phase "verifying" when the change is written and you are running the tests/review, and phase "building" if that sends you back to fixing; the card moves Doing → Testing → Done with it.',
     "- Work in this thread's own bb worktree branch; never edit, stash, or commit in the shared main checkout (the first entry of `git worktree list --porcelain`).",
-    "- When make test-<app> and make lint are green, merge your branch into local main: `git -C <main checkout> merge --no-ff <branch>`, only if that checkout is on main and the merge touches no locally modified file; otherwise report blocked.",
+    "- When make test-<app> and make lint are green, merge your branch into local main: `git -C <main checkout> merge --no-ff <branch>`, only if that checkout is on main and the merge touches no locally modified file; otherwise report blocked. Then ALWAYS `git -C <main checkout> push origin main` (never force) — standing policy.",
     ...common,
   ];
 }
@@ -1027,7 +1037,7 @@ export function workerInstructions(taskTitle: string, mode: TaskMode = "task"): 
     "You are working a Chief of Staff task:",
     JSON.stringify(taskTitle),
     "Use chief_of_staff_report to report progress and completion, and chief_of_staff_ask only when blocked on a question you cannot decide.",
-    'Reversible work (code, docs, tests, local commits, merge to LOCAL main once everything passes) needs no approval. Irreversible or high-impact actions (deleting data, destructive migrations, secrets, paid actions, external messages, production the task did not ask for) need chief_of_staff_ask with kind "irreversible" and an explicit yes — never proceed on a dismissal or timeout.',
+    'Reversible work (code, docs, tests, local commits, merge to LOCAL main, and the standing `git push origin main` after a green merge) needs no approval. Irreversible or high-impact actions (deleting data, destructive migrations, secrets, paid actions, external messages, production/deploy the task did not ask for) need chief_of_staff_ask with kind "irreversible" and an explicit yes — never proceed on a dismissal or timeout.',
     mode === "feature"
       ? "This is a feature task: it ships through the feature-delivery workflow; report done only with the workflow's final workflowStatus."
       : "If a routine question errors or times out, proceed with your best judgment and note it in your final report.",

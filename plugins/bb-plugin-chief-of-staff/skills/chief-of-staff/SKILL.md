@@ -86,8 +86,9 @@ Operating constraints:
   policies, wait for
   Denis without a timeout, and a dismissal means **no**
   (`chief_of_staff_ask` with `kind: "irreversible"`, also detected from the
-  question text). Push/deploy questions are auto-allowed only when the task
-  text explicitly asked for a push/deploy/release. Detection is negation- and
+  question text). Plain `git push origin` after a green merge is standing policy
+  (always allowed). Deploy/release questions are auto-allowed only when the task
+  text explicitly asked for a deploy/release. Detection is negation- and
   context-aware: "no DNS change", "don't spend", "without touching certs",
   reading DNS/certs and estimating cost are routine; genuinely ambiguous DNS,
   cert or money questions escalate. Phrase questions plainly, one action per

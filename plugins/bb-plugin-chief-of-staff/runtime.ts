@@ -20,6 +20,7 @@ import {
   type BoardColumn,
   CHANGED_CHANNEL,
   classifyQuestion,
+  triageQuestion,
   classifyDependencies,
   classifyTask,
   describeAnswer,
@@ -783,8 +784,10 @@ export class ChiefOfStaff {
     const triage = classifyQuestion(`${question}\n${input.context ?? ""}`, deployRequested, input.kind);
 
     if (triage === "deploy-allowed") {
-      const answer =
-        "This task explicitly asks for the push/deploy, so it is allowed: do it only after everything is merged to local main and all tests pass, push without force, use the documented deploy procedure for the affected area, and report what you did. Anything else irreversible still needs Denis.";
+      const detail = triageQuestion(`${question}\n${input.context ?? ""}`, deployRequested, input.kind);
+      const answer = detail.reason.includes("standing policy")
+        ? "Push after a green merge is standing policy: once everything is merged to local main and tests pass, `git push origin main` (never force) and report what you pushed. Do not deploy unless the task asked for a deploy/release. Anything else irreversible still needs Denis."
+        : "This task explicitly asks for the deploy/release, so it is allowed: after a green merge to local main and all tests pass, `git push origin main` (never force; standing policy), then use the documented deploy procedure for the affected area only, and report what you did. Anything else irreversible still needs Denis.";
       this.store.insertDecision({
         itemId: String(task.taskId),
         threadId,

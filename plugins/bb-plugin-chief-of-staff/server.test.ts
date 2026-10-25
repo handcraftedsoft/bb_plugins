@@ -533,7 +533,7 @@ test("a feature-labelled task spawns a workflow driver on the cheap model with f
     expect(prompt).toContain("bb workflows run --name feature-delivery");
     expect(prompt).toContain('"feature":"qr-import"');
     expect(prompt).toContain('"deployRequested":false');
-    expect(prompt).toContain("does NOT ask for a push");
+    expect(prompt).toContain("does NOT ask for one");
     const overview = await harness.behavior.callRpc("overview", null);
     expect(overview.tasks[0]!.mode).toBe("feature");
   } finally {
@@ -663,7 +663,7 @@ test("irreversible questions bypass policy, never time out, and a dismissal mean
   }
 });
 
-test("push/deploy questions are allowed only when the task asked for them", async () => {
+test("push alone is standing policy; deploy still needs the task to ask", async () => {
   const { harness } = await makeHarness({
     tasks: [
       { id: 29, title: "Update landing copy and deploy to production", assignees: ["CTO-bot"], bucketId: 16 },
@@ -672,12 +672,18 @@ test("push/deploy questions are allowed only when the task asked for them", asyn
   });
   try {
     await syncNow(harness);
-    const allowed = await harness.behavior.callAgentTool(
+    const allowedDeploy = await harness.behavior.callAgentTool(
       "chief_of_staff_ask",
       { question: "Tests are green and main is merged. Should I push and deploy now?" },
       { threadId: "th_w1" },
     );
-    expect(allowed).toContain("deploy requested by the task");
+    expect(allowedDeploy).toMatch(/deploy|standing policy/i);
+    const allowedPush = await harness.behavior.callAgentTool(
+      "chief_of_staff_ask",
+      { question: "Tests are green and main is merged. Should I push to origin now?" },
+      { threadId: "th_w2" },
+    );
+    expect(allowedPush).toMatch(/standing policy|push/i);
     const pending = harness.behavior.callAgentTool(
       "chief_of_staff_ask",
       { question: "Tests are green and main is merged. Should I push and deploy now?" },

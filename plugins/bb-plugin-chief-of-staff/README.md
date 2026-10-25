@@ -45,7 +45,9 @@ worker thread:
   `skip the release`, …) mean NO; bare mentions (`deploy script`, `deploy
   docs`, `push notifications`, `release build`, `was deployed`) don't count;
   only clear affirmatives (`and deploy to prod`, `push to origin`, `redeploy
-  prod`, `ship it`, an imperative `Deploy the …`) mean YES. Ambiguous → NO.
+  prod`, `ship it`, an imperative `Deploy the …`) mean YES deploy. Ambiguous → NO.
+  Separately: after a green merge to local main, **always** `git push origin main`
+  (never force) — standing policy Oct 2026; that push no longer needs deploy intent.
 - **Feature names.** An explicit `feature: <kebab-name>` line (markdown
   `**feature:** \`name\`` and HTML `<p>` tolerated) is used verbatim.
   Otherwise the name is a deterministic slug of the title: parenthesized /
@@ -115,7 +117,9 @@ worker thread:
   merge into main) is the second line of defence.
 - **Reversible work proceeds, irreversible work waits.** Irreversible or
   high-impact questions bypass the policies, never time out, and a dismissal
-  means no. Push/deploy is allowed only when the task explicitly asked for it.
+  means no. Plain `git push origin` after a green merge is standing policy (always
+  allowed). Deploy/release to production/staging/stores is allowed only when the
+  task explicitly asked for it.
   Question triage (`triageQuestion` in `logic.ts`) is negation- and
   context-aware:
   - The text is split into clauses (sentence punctuation; but / however /
@@ -143,7 +147,8 @@ worker thread:
     ("purchase flow", "billing page", "paying users") are routine.
   - Changing production config/env vars/feature flags escalates even when
     the task asked for a deploy; so do force-push, DNS and cert changes.
-  - Deploy/push/release/production mentions follow the deploy rules
+  - Plain push-to-origin questions are auto-allowed (standing policy). 
+    Deploy/release/production/store mentions follow the deploy rules
     (negation-aware; allowed only when the task asked for a deploy); reading
     production ("check the prod logs") is routine.
 - **Briefings.** A running digest — decisions pending, in flight, stalled,

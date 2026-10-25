@@ -85,8 +85,8 @@ test("triage: genuinely ambiguous DNS/cert/money questions escalate", () => {
   expect(classifyQuestion("Should the DNS be changed?", false)).toBe("irreversible");
 });
 
-test("triage: deploy questions follow the deploy rules, negation-aware", () => {
-  expect(classifyQuestion("Should I push to origin now?", false)).toBe("irreversible");
+test("triage: push is standing policy; deploy still follows deploy rules", () => {
+  expect(classifyQuestion("Should I push to origin now?", false)).toBe("deploy-allowed");
   expect(classifyQuestion("Should I push to origin now?", true)).toBe("deploy-allowed");
   expect(classifyQuestion("Can I deploy to prod?", false)).toBe("irreversible");
   expect(classifyQuestion("I won't deploy; should I rename the module?", false)).toBe("routine");

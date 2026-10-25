@@ -98,9 +98,11 @@ test("classifyTask: explicit feature line (markdown-tolerant) wins over the titl
 test("question routing: push notifications / release builds are not deploy questions", () => {
   expect(classifyQuestion("Should I add push notifications via FCM?", false)).toBe("routine");
   expect(classifyQuestion("Should the release build use R8?", false)).toBe("routine");
-  expect(classifyQuestion("Should I push to origin now?", false)).toBe("irreversible");
+  expect(classifyQuestion("Should I push to origin now?", false)).toBe("deploy-allowed");
   expect(classifyQuestion("Should I push to origin now?", true)).toBe("deploy-allowed");
   expect(classifyQuestion("Can I deploy to prod?", false)).toBe("irreversible");
+  expect(classifyQuestion("Can I deploy to prod?", true)).toBe("deploy-allowed");
+  expect(classifyQuestion("Tests are green. Should I push and deploy now?", false)).toBe("irreversible");
 });
 
 test("parseBuckets accepts the v2 envelope and bare arrays, sorted by position", () => {
