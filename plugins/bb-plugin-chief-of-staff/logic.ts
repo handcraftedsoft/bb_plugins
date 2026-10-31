@@ -94,6 +94,8 @@ export interface CosSettings {
   featureWorkerModel: string;
   taskWorkerModel: string;
   workerReasoning: string;
+  /** Permission mode for worker threads ("" = project/product default). Workflow helpers inherit it. */
+  workerPermissionMode: string;
 }
 
 export type TaskMode = "feature" | "task";

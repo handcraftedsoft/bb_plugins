@@ -451,6 +451,7 @@ export class ChiefOfStaff {
       prompt: buildWorkerPrompt(task, this.planFor(meta, settings)),
       title: `#${task.id} ${task.title}`.slice(0, 120),
       pluginMetadata: { itemId: String(task.id), mode: meta.mode },
+      ...workerPermission(settings.workerPermissionMode),
     };
     const model = meta.mode === "feature" ? settings.featureWorkerModel : settings.taskWorkerModel;
     if (settings.workerProvider !== "" && model !== "") {
@@ -1652,4 +1653,14 @@ export class ChiefOfStaff {
     this.resolvers.clear();
     this.wake();
   }
+}
+
+const WORKER_PERMISSION_MODES = ["accept-edits", "auto", "full"] as const;
+type WorkerPermissionMode = (typeof WORKER_PERMISSION_MODES)[number];
+
+/** Spawn args for the configured worker permission mode ("" = project default). */
+function workerPermission(mode: string): { permissionMode?: WorkerPermissionMode } {
+  return (WORKER_PERMISSION_MODES as readonly string[]).includes(mode)
+    ? { permissionMode: mode as WorkerPermissionMode }
+    : {};
 }

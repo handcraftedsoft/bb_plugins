@@ -153,6 +153,7 @@ const DEFAULTS: CosSettings = {
   featureWorkerModel: "account:zai-individual-coding-plan/GLM-5.3-Flash",
   taskWorkerModel: "account:zai-individual-coding-plan/GLM-5.3",
   workerReasoning: "high",
+  workerPermissionMode: "",
 };
 
 function clampInt(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -254,6 +255,12 @@ export default async function plugin(bb: BbPluginApi) {
       default: DEFAULTS.workerReasoning,
       experimental_schema: z.string().trim().max(20),
     },
+    workerPermissionMode: {
+      type: "string",
+      label: "Worker permission mode: accept-edits, auto or full (empty = project default); workflow helpers inherit it",
+      default: DEFAULTS.workerPermissionMode,
+      experimental_schema: z.union([z.literal(""), z.enum(["accept-edits", "auto", "full"])]),
+    },
   });
 
   function str(value: unknown, fallback: string, allowEmpty = false): string {
@@ -283,6 +290,7 @@ export default async function plugin(bb: BbPluginApi) {
       featureWorkerModel: str(values.featureWorkerModel, DEFAULTS.featureWorkerModel, true),
       taskWorkerModel: str(values.taskWorkerModel, DEFAULTS.taskWorkerModel, true),
       workerReasoning: str(values.workerReasoning, DEFAULTS.workerReasoning, true),
+      workerPermissionMode: str(values.workerPermissionMode, DEFAULTS.workerPermissionMode, true),
     };
   }
 
