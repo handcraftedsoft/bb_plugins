@@ -725,15 +725,18 @@ export interface WorkerPlan {
   workflowName: string;
 }
 
+/** Nonblocking question handoff: the long-held ask tool is unreliable. */
+export const QUESTION_HANDOFF = 'Do not call chief_of_staff_ask. When genuinely blocked, call chief_of_staff_report with stage "blocked" and a note whose first line is exactly: QUESTION: #<task> [irreversible|routine] thread=<your BB thread id> run=<workflow run id or none> | <question> | options: <A> / <B> / <C>. Also post the same text as a Vikunja comment if available. Then STOP and leave the run parked until Denis or his assistant answers via bb thread tell. Silence, errors, timeouts and generic nudges never authorize an option. Report progress with ANSWERED: #<task> <chosen option> before continuing. If a routine choice can safely be made without asking, use best judgment and note it instead.';
+
 function deployRule(plan: WorkerPlan): string {
   return plan.deployRequested
     ? "- Push/deploy: after a green merge to local main, ALWAYS `git push origin main` (never force) — standing policy. This task ALSO asks for a deploy/release: use the documented deploy procedure for the affected area only, after the push."
-    : "- Push: after a green merge to local main, ALWAYS `git push origin main` (never force) — standing policy (Denis, Oct 2026). Deploy/release to production/staging/stores: this task does NOT ask for one, so do not deploy. If you believe a deploy is needed, ask with chief_of_staff_ask (kind \"irreversible\") and wait.";
+    : "- Push: after a green merge to local main, ALWAYS `git push origin main` (never force) — standing policy (Denis, Oct 2026). Deploy/release to production/staging/stores: this task does NOT ask for one, so do not deploy. If you believe a deploy is needed, use the QUESTION handoff below and wait.";
 }
 
 const REVERSIBILITY_RULES = [
   "- Reversible work needs no approval: code, docs, tests, local commits, and merging into LOCAL main once everything passes. Do it without asking.",
-  "- Irreversible or high-impact actions need Denis first: deleting data, destructive migrations on real data, secrets/credential changes, anything paid, external messages (email, chat, social), and anything touching production the task did not ask for. Ask with chief_of_staff_ask (kind \"irreversible\"), wait for the answer, and never proceed without an explicit yes — a dismissed or withdrawn irreversible question means NO.",
+  "- Irreversible or high-impact actions need Denis first: deleting data, destructive migrations on real data, secrets/credential changes, anything paid, external messages (email, chat, social), and anything touching production the task did not ask for. Use the QUESTION handoff below and wait for the answer, and never proceed without an explicit yes — a dismissed or withdrawn irreversible question means NO.",
 ];
 
 /** Rules shared by the first prompt and the hand-off message for adopted threads. */
@@ -742,7 +745,7 @@ export function operatingRules(plan: WorkerPlan): string[] {
     ...REVERSIBILITY_RULES,
     deployRule(plan),
     '- Report with chief_of_staff_report: "started" when you begin, "progress" with a short note after each meaningful step, "done" only when finished, "failed" if you cannot finish, "blocked" when you cannot proceed.',
-    "- Ask routine questions with chief_of_staff_ask only when genuinely blocked; if a ROUTINE question errors or times out, proceed with your best judgment and note it in your final report.",
+    "- " + QUESTION_HANDOFF,
     "- Follow AGENTS.md (repo root and the area you touch). No tm/bd/br task tracker exists here; never push --force, use --no-verify, or rewrite history.",
   ];
   if (plan.mode === "feature") {
@@ -921,6 +924,8 @@ export interface SchedulingInput {
   /** Feature tasks currently driving a workflow run. */
   active: ActiveFeatureRun[];
   maxFeatureRuns: number;
+  /** Updated feature-delivery acquires device leases at Build, not dispatch. */
+  resourcesManagedByWorkflow?: boolean;
   /** True when the hard dependency is merged to main. */
   depDone: (slug: string) => boolean;
   /** The CoS task that delivers a feature slug, when known. */
@@ -944,7 +949,7 @@ export function schedulingDecision(input: SchedulingInput): SchedulingDecision {
     });
     return { eligible: false, layer: "hard", reason: `hard dependency: waiting for ${named.join(", ")} to merge to main` };
   }
-  for (const resource of input.deps.resources) {
+  for (const resource of input.resourcesManagedByWorkflow ? [] : input.deps.resources) {
     const holder =
       input.active.find((run) => run.resources.includes(resource)) ??
       input.active.find((run) => run.resources.some((held) => resourcesConflict(resource, held)));
@@ -1019,13 +1024,14 @@ export function buildWorkerPrompt(
       `3. From this thread's workspace root run: bb workflows run --name ${plan.workflowName} --args "$(cat ${argsFile})"`,
       `   Report "progress" with the run id (workflowRunId). The workflow notifies this thread when it finishes; check with \`bb workflows status <run-id>\` whenever you are woken or nudged, and report "progress" with the run's current phase in the phase field (Queue, Spec, Contract, Approval, Build, Verify, Merge, Deliver; "repair" when Verify sent it back to Build) — the kanban card follows it. Phase "Queue" / "queued behind <run id>" means the run waits for a lease (a shared resource such as the emulator, a free slot under the parallel-run cap, or a hard dependency merging to main): that is normal, keep waiting; never stop, restart or re-run it. Other feature runs may be active at the same time; never touch their worktrees, containers or the emulator.`,
       `4. When the run finishes, read its result (bb workflows status <run-id>; the result has status, nextAction, report, repairIssues, specRound):`,
-      `   - nextAction "approve": the spec flagged irreversible/high-impact work. Call chief_of_staff_ask with kind "irreversible", the result's approvalReasons and report as context, options ["Approve", "Revise: <notes>", "Cancel"]. Approve → re-run with the SAME args plus "approved": true and --resume <run-id> (write ${argsFile.replace(".json", "-approved.json")} once from the frozen file with approved:true added). Revise → a new run whose brief is the frozen brief plus the notes (this IS a fresh Spec: bump specRound by 1, omit continueRepair; if the new specRound would exceed MAX_SPEC_ROUNDS (3), do NOT Spec — report blocked with remaining reasons and ask Denis). Cancel → report "failed" with "cancelled by Denis".`,
+      `   - nextAction "approve": the spec flagged irreversible/high-impact work. Use the QUESTION handoff with kind irreversible, the result's approvalReasons and report as context, options ["Approve", "Revise: <notes>", "Cancel"]. Approve → re-run with the SAME args plus "approved": true and --resume <run-id> (write ${argsFile.replace(".json", "-approved.json")} once from the frozen file with approved:true added). Revise → a new run whose brief is the frozen brief plus the notes (this IS a fresh Spec: bump specRound by 1, omit continueRepair; if the new specRound would exceed MAX_SPEC_ROUNDS (3), do NOT Spec — report blocked with remaining reasons and ask Denis). Cancel → report "failed" with "cancelled by Denis".`,
       `   - status "${plan.deployRequested ? "delivered" : "merged-to-main"}": report "done" with workflowRunId and workflowStatus.`,
+      `   - status "lane-less-blocked" or legacy "nothing-to-build": report "blocked" with the reason. No app lanes is not completion: documentation must still be implemented, independently checked and merged. Do not rerun a fresh Spec blindly or mark the task done.`,
       `   - status "queue-timeout" (nextAction "rerun"): nothing was started; start ONE fresh run with the same frozen args (same specRound).`,
       `   - nextAction "continue-repair" (or status "partial" with repairIssues, or status "main-merge-failed" with mergeConflict / nextAction continue-repair, or after YOU as manager adopted/fixed process or lane-ownership review findings on the integration branch): DO NOT launch a fresh Spec and DO NOT stuff findings into a new brief. Write ${argsFile.replace(".json", "-continue.json")} from the frozen args plus continueRepair:true, repairIssues from the result (map of app -> finding strings; after manager adoption, list the findings you just closed / "re-verify manager adoption on integration"), and the SAME specRound; when the result has mergeConflict or mergeConflictRepair, ALSO set mergeConflictRepair:true and copy mergeConflict from the result. Run bb workflows run --name ${plan.workflowName} --args "$(cat that file)". Resume on the existing branch: review findings → repair→verify→review; main-merge conflict → resolve on integration + re-checks; manager-adopted process MAJORs → re-verify/re-review only (no lane rebuild, no fresh Spec).`,
-      `   - status "spec-rounds-exhausted" (nextAction "pause"): already used 3 fresh Spec launches for this ticket. Report "blocked", surface remaining MAJORs (result.report + repairIssues) in a Vikunja comment / chief_of_staff_ask; do NOT burn another Spec. Options: continueRepair on the existing branch if findings are repairable, hand to Denis, or cancel.`,
+      `   - status "spec-rounds-exhausted" (nextAction "pause"): already used 3 fresh Spec launches for this ticket. Report "blocked", surface remaining MAJORs (result.report + repairIssues) through the QUESTION handoff; do NOT burn another Spec. Options: continueRepair on the existing branch if findings are repairable, hand to Denis, or cancel.`,
       `   - Fresh Spec only on: first attempt, true scope change (Denis revise notes / explicit new scope), or explicit new ticket. NEVER start a fresh Spec solely because of a main merge conflict — that is continue-repair / mergeConflictRepair. NEVER start a fresh Spec solely because the manager (you) patched process / lane-ownership MAJORs on the integration branch (manager adoption) — that is continue-repair (re-verify/re-review, same specRound). When older notes say "manager fixes + ONE FRESH run", that means one continueRepair run on the existing branch, NOT a new Codex Spec. When you must Spec again (not continue-repair): bump specRound by 1 in a new args file (omit continueRepair/repairIssues/mergeConflictRepair/mergeConflict). If new specRound > 3, pause as above instead.`,
-      `   - anything else (partial without repairIssues, main-merge-failed with nextAction human-merge, contract-failed, deliver-failed, fix-lane legacy, ...): report "blocked" with the result's report, then chief_of_staff_ask (routine) whether to continue-repair (preferred when review findings remain, a merge conflict was involved, or you just manager-adopted process fixes on integration), start a fresh Spec (bump specRound; never for merge conflicts alone; never solely because manager patched process MAJORs), hand it to Denis, or cancel.`,
+      `   - anything else (partial without repairIssues, main-merge-failed with nextAction human-merge, contract-failed, deliver-failed, fix-lane legacy, ...): report "blocked" with the result's report, then use the QUESTION handoff (routine) to ask whether to continue-repair (preferred when review findings remain, a merge conflict was involved, or you just manager-adopted process fixes on integration), start a fresh Spec (bump specRound; never for merge conflicts alone; never solely because manager patched process MAJORs), hand it to Denis, or cancel.`,
       "",
       "Operating rules:",
       ...operatingRules(plan),
@@ -1049,11 +1055,11 @@ export function workerInstructions(taskTitle: string, mode: TaskMode = "task"): 
   return [
     "You are working a Chief of Staff task:",
     JSON.stringify(taskTitle),
-    "Use chief_of_staff_report to report progress and completion, and chief_of_staff_ask only when blocked on a question you cannot decide.",
-    'Reversible work (code, docs, tests, local commits, merge to LOCAL main, and the standing `git push origin main` after a green merge) needs no approval. Irreversible or high-impact actions (deleting data, destructive migrations, secrets, paid actions, external messages, production/deploy the task did not ask for) need chief_of_staff_ask with kind "irreversible" and an explicit yes — never proceed on a dismissal or timeout.',
+    QUESTION_HANDOFF,
+    'Reversible work (code, docs, tests, local commits, merge to LOCAL main, and the standing `git push origin main` after a green merge) needs no approval. Irreversible or high-impact actions (deleting data, destructive migrations, secrets, paid actions, external messages, production/deploy the task did not ask for) need the QUESTION handoff with kind "irreversible" and an explicit yes — never proceed on a dismissal or timeout.',
     mode === "feature"
       ? "This is a feature task: it ships through the feature-delivery workflow; report done only with the workflow's final workflowStatus."
-      : "If a routine question errors or times out, proceed with your best judgment and note it in your final report.",
+      : "Make safe routine choices without blocking; after posting a QUESTION, wait for an explicit answer.",
   ].join("\n");
 }
 

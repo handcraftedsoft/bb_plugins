@@ -30,6 +30,7 @@ import {
   type TaskDeps,
   featureDoneAllowed,
   operatingRules,
+  QUESTION_HANDOFF,
   filterByAssignee,
   matchPolicy,
   parseKeywords,
@@ -361,6 +362,7 @@ export class ChiefOfStaff {
       deps,
       active: this.store.activeFeatureRuns().filter((run) => run.taskId !== task.id),
       maxFeatureRuns: settings.maxFeatureRuns,
+      resourcesManagedByWorkflow: settings.workflowName === "feature-delivery",
       depDone: (slug) => done.get(slug) === true,
       taskForFeature: (slug) => this.store.featureTask(slug)?.taskId ?? null,
     });
@@ -426,6 +428,7 @@ export class ChiefOfStaff {
       deps: { ...deps, dependsOn: [] },
       active: this.store.activeFeatureRuns().filter((run) => run.taskId !== taskId),
       maxFeatureRuns: settings.maxFeatureRuns,
+      resourcesManagedByWorkflow: settings.workflowName === "feature-delivery",
       depDone: () => true,
     });
   }
@@ -660,7 +663,7 @@ export class ChiefOfStaff {
     await this.sendToThread(
       threadId,
       [
-        `The Chief of Staff plugin now manages Vikunja task #${task.id} (${JSON.stringify(task.title)}). Continue working on it. From now on, report with chief_of_staff_report and, when blocked on the user, call chief_of_staff_ask.`,
+        `The Chief of Staff plugin now manages Vikunja task #${task.id} (${JSON.stringify(task.title)}). Continue working on it. From now on, report with chief_of_staff_report. ${QUESTION_HANDOFF}`,
         "",
         "Operating rules from now on:",
         ...operatingRules(this.planFor(meta, settings)),
@@ -1275,7 +1278,7 @@ export class ChiefOfStaff {
 
   async handleThreadFailed(threadId: string, error: string | null): Promise<void> {
     const task = this.store.taskByThreadId(threadId);
-    if (task === null || task.state !== "active") return;
+    if (task === null || task.state !== "active" || task.progressNote?.startsWith("blocked: QUESTION:")) return;
     if (task.retries < AUTO_RETRIES) {
       try {
         await this.bb.sdk.threads.retry({ threadId, reason: "Chief of Staff auto-retry" });
@@ -1387,7 +1390,7 @@ export class ChiefOfStaff {
 
         if (task.updated !== row.lastTaskUpdated) {
           this.store.updateTask(task.id, { lastTaskUpdated: task.updated });
-          if (alive.status === "idle") {
+          if (alive.status === "idle" && !row.progressNote?.startsWith("blocked: QUESTION:")) {
             try {
               await this.sendToThread(
                 row.threadId,
@@ -1407,6 +1410,8 @@ export class ChiefOfStaff {
 
         // Keep moving: nudge idle, quiet workers that are not waiting on the user.
         if (this.store.hasPendingDecisionForTask(task.id)) continue;
+        // Nonblocking QUESTION reports are parked until an explicit answer.
+        if (row.progressNote?.startsWith("blocked: QUESTION:")) continue;
         // An idle driver whose workflow run is queued/running is waiting for the
         // run's completion notification, not stuck: never nudge it.
         const liveStatus = this.store.getTaskMeta(task.id)?.runStatus ?? null;
@@ -1428,7 +1433,7 @@ export class ChiefOfStaff {
         try {
           await this.sendToThread(
             row.threadId,
-            "Status check from your chief of staff: report where you are with chief_of_staff_report (stage 'progress' and a short note), or stage 'done' if the task is finished. If you are blocked on the user, call chief_of_staff_ask now.",
+            "Status check from your chief of staff: report where you are with chief_of_staff_report (stage 'progress' and a short note), or stage 'done' if the task is finished. " + QUESTION_HANDOFF,
           );
           this.store.updateTask(task.id, { nudgeCount: row.nudgeCount + 1, progressAt: now });
           this.bb.log.info(`nudged idle worker for task ${task.id} (nudge ${row.nudgeCount + 1})`);

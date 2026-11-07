@@ -3,6 +3,29 @@ name: chief-of-staff
 description: Drive the Chief of Staff with the bb chief command — it runs Vikunja tasks assigned to CTO-bot through worker threads and collects decisions, policies, and briefings.
 ---
 
+## Current workflow safety and scheduling
+
+For the `feature-delivery` workflow, CoS dispatch gates only on hard dependencies
+and the run cap. It records resource needs for visibility, but the workflow owns
+exclusive resource leases when Build/test needs them. This allows a second mobile
+Spec while another run owns the emulator. Custom workflow names keep conservative
+CoS resource gating. Roll out together with feature-delivery's phase-scoped lease
+change; never bypass the workflow's device lock manually.
+
+Do not use `chief_of_staff_ask` for new worker questions: its long-held connection
+is unreliable. Report stage `blocked` with a first line of:
+`QUESTION: #<task> [irreversible|routine] thread=<thread id> run=<run id or none> | <question> | options: <A> / <B> / <C>`.
+Post the same text as a task comment when available. Stop until Denis or his
+assistant answers through `bb thread tell`; errors, timeouts, generic nudges and
+silence are not approval. Report `progress` with `ANSWERED: #<task> <option>` before
+continuing. Such QUESTION reports suppress automatic nudges, update wakeups and
+failure retries. The legacy ask/decision APIs remain compatible for existing calls.
+
+No app lanes is not evidence of completion. `lane-less-blocked` and legacy
+`nothing-to-build` remain blocked; do not automatically restart Spec. Documentation
+work must pass its independent acceptance check and normal merge/delivery gates.
+
+
 The Chief of Staff plugin runs the Vikunja backlog for one assignee (by
 default `CTO-bot`): every open task assigned to that user gets a BB worker
 thread in the configured project (`proj_jjitzuscx6`, rateyourfood) — reusing

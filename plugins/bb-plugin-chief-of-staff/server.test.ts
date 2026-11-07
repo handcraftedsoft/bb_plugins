@@ -1183,7 +1183,7 @@ test("dependency layers: backend runs beside Android, same resource and hard dep
       { id: 43, title: "Admin web", description: "feature: admin-web<br>Depends-on: admin-auth", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
     ],
   };
-  const { harness, vikunjaCalls } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4 });
+  const { harness, vikunjaCalls } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4, workflowName: "legacy-device-workflow" });
   try {
     await syncNow(harness);
     // Android + backend in parallel (soft dep on Android does not block).
@@ -1228,7 +1228,7 @@ test("heavy-device group: a live ios-simulator lease is recorded; resuming an An
     ],
     runs: { th_w1: [{ id: "wfr_ios", status: "running", currentPhase: "Build" }] },
   };
-  const { harness } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4 });
+  const { harness } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4, workflowName: "legacy-device-workflow" });
   try {
     await syncNow(harness);
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
@@ -1277,7 +1277,7 @@ test("heavy-device group: a linked (adopted) thread is not resumed while a confl
       { id: 72, title: "iOS simulator smoke", description: "feature: ios-smoke", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
     ],
   };
-  const { harness } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4 });
+  const { harness } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4, workflowName: "legacy-device-workflow" });
   try {
     await syncNow(harness);
     fake.tasks.push({ id: 73, title: "Android rename", description: "feature: android-rename-2<br>Resources: emulator, android-sdk-gradle", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 });
@@ -1301,7 +1301,7 @@ test("heavy-device group: `bb chief resources` records a running task's real res
       { id: 76, title: "Android rename", description: "feature: android-rename-3<br>Resources: emulator, android-sdk-gradle", assignees: ["CTO-bot"], labels: ["feature"], bucketId: 16 },
     ],
   };
-  const { harness } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4 });
+  const { harness } = await makeHarness(fake, { maxFeatureRuns: 3, maxConcurrent: 4, workflowName: "legacy-device-workflow" });
   try {
     await syncNow(harness);
     await harness.behavior.runCli(["pause", "76"]);
@@ -1321,4 +1321,37 @@ test("heavy-device group: `bb chief resources` records a running task's real res
   } finally {
     await harness.lifecycle.dispose();
   }
+});
+
+test("feature-delivery dispatches competing mobile Specs but retains the run cap", async () => {
+  const fake: FakeVikunja = { tasks: [90, 91, 92].map((id) => ({ id, title: `Android screen ${id}`, description: `feature: android-${id}`, labels: ["feature"], assignees: ["CTO-bot"], bucketId: 16 })) };
+  const { harness } = await makeHarness(fake, { maxFeatureRuns: 2, maxConcurrent: 4 });
+  try {
+    await syncNow(harness);
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    const overview = await harness.behavior.callRpc("overview", null);
+    expect(overview.tasks.find((task) => task.taskId === 92)?.blockReason).toContain("slot");
+  } finally { await harness.lifecycle.dispose(); }
+});
+
+test("nonblocking QUESTION reports are not retried or nudged while waiting for an answer", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const fake: FakeVikunja = { tasks: [{ id: 93, title: "Needs a decision", assignees: ["CTO-bot"], bucketId: 16 }] };
+  const { harness } = await makeHarness(fake, { stallMinutes: 1 });
+  try {
+    await syncNow(harness);
+    await report(harness, { stage: "blocked", note: "QUESTION: #93 [irreversible] thread=th_w1 run=none | Proceed? | options: yes / no" });
+    const before = harness.inspection.sdk.callsTo("threads.send").length;
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    await syncNow(harness);
+    expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(before);
+    expect((await harness.behavior.callRpc("overview", null)).tasks[0]!.nudgeCount).toBe(0);
+    await harness.behavior.emitThreadEvent("thread.failed", { thread: makeThreadResponse({ id: "th_w1" }), error: "provider failed while parked" });
+    expect(harness.inspection.sdk.callsTo("threads.retry")).toHaveLength(0);
+    await report(harness, { stage: "progress", note: "ANSWERED: #93 no" });
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    await syncNow(harness);
+    expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(before + 1);
+
+  } finally { vi.useRealTimers(); await harness.lifecycle.dispose(); }
 });

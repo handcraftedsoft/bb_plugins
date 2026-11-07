@@ -310,3 +310,30 @@ test("buildWorkerPrompt: continue-repair / spec-rounds-exhausted / no fresh Spec
   expect(prompt).toMatch(/Manager adoption exception/);
   expect(operatingRules({ mode: "feature", feature: "backend-scaffold", deployRequested: false, workflowName: "feature-delivery" }).join("\n")).toMatch(/continueRepair:true/);
 });
+
+test("question instructions consistently use the nonblocking handoff and retain closure gates", async () => {
+  const { workerInstructions, QUESTION_HANDOFF, featureDoneAllowed } = await import("./logic");
+  for (const mode of ["task", "feature"] as const) {
+    const prompt = buildWorkerPrompt({ id: 83, title: "Documentation", description: "" }, { mode, feature: "docs", deployRequested: false, workflowName: "feature-delivery" });
+    expect(prompt).toContain(QUESTION_HANDOFF);
+    expect(workerInstructions("Documentation", mode)).toContain(QUESTION_HANDOFF);
+    expect(prompt.replace(QUESTION_HANDOFF, "")).not.toContain("chief_of_staff_ask");
+  }
+  expect(featureDoneAllowed("nothing-to-build", false)).toBe(false);
+  expect(featureDoneAllowed("lane-less-blocked", false)).toBe(false);
+  expect(featureDoneAllowed("merged-to-main", false)).toBe(true);
+  expect(featureDoneAllowed("merged-to-main", true)).toBe(false);
+});
+
+test("workflow-managed leases allow parallel planning while retaining hard dependencies and cap", async () => {
+  const { schedulingDecision } = await import("./logic");
+  const input = {
+    deps: { dependsOn: [] as string[], resources: ["emulator"], softAfter: [], source: { dependsOn: "", resources: "", softAfter: "" } },
+    active: [{ taskId: 1, feature: "ios", resources: ["ios-simulator"] }],
+    maxFeatureRuns: 3, depDone: () => false, resourcesManagedByWorkflow: true,
+  };
+  expect(schedulingDecision(input).eligible).toBe(true);
+  expect(schedulingDecision({ ...input, maxFeatureRuns: 1 }).layer).toBe("cap");
+  expect(schedulingDecision({ ...input, deps: { ...input.deps, dependsOn: ["api"] } }).layer).toBe("hard");
+  expect(schedulingDecision({ ...input, resourcesManagedByWorkflow: false }).layer).toBe("resource");
+});
