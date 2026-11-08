@@ -161,6 +161,24 @@ async function hasWorkflowLease(runId: string): Promise<boolean> {
   return false;
 }
 
+/** Only a fresh, matching resource waiter can excuse a lease-less Queue run.
+ * Missing, stale, malformed or unreadable records remain conservatively counted. */
+export function isFreshResourceWait(record: unknown, runId: string, now = Date.now()): boolean {
+  if (!record || typeof record !== "object") return false;
+  const item = record as Record<string, unknown>;
+  const match = typeof item.blockedBy === "string" ? /^resource ([a-z0-9][a-z0-9-]*)$/.exec(item.blockedBy) : null;
+  return item.runId === runId && item.depsMet === true && match !== null &&
+    Array.isArray(item.resources) && item.resources.length > 0 && item.resources.includes(match[1]) &&
+    item.resources.every((r) => typeof r === "string" && /^[a-z0-9][a-z0-9-]*$/.test(r)) &&
+    typeof item.seenAt === "number" && Number.isFinite(item.seenAt) &&
+    item.seenAt <= now && now - item.seenAt <= 180_000;
+}
+async function hasFreshResourceWait(runId: string): Promise<boolean> {
+  const file = runId.replace(/[^A-Za-z0-9_.:-]/g, "_") + ".json";
+  const record = JSON.parse(await readFile(join(homedir(), ".bb", "locks", "rateyourfood-feature-delivery.lock.queue", file), "utf8"));
+  return isFreshResourceWait(record, runId);
+}
+
 /** Test seams: existing branch/worktree names; whether a feature is merged to main;
  * the resources a workflow run's live lease holds. */
 export const runtimeHooks: {
@@ -168,7 +186,8 @@ export const runtimeHooks: {
   featureMerged: (repo: string, slug: string) => Promise<boolean>;
   leaseResources: (runId: string) => Promise<string[] | null>;
   hasWorkflowLease: (runId: string) => Promise<boolean>;
-} = { gitNames, featureMerged, leaseResources, hasWorkflowLease };
+  hasFreshResourceWait: (runId: string) => Promise<boolean>;
+} = { gitNames, featureMerged, leaseResources, hasWorkflowLease, hasFreshResourceWait };
 
 /** Error prefix for a paused feature task that keeps its worker thread but is
  * held back by the scheduler (resource / cap); the sweep resumes it when eligible. */
@@ -375,7 +394,7 @@ export class ChiefOfStaff {
     }
   }
 
-  /** A dependency-waiting workflow owns no productive slot. Require a fresh
+  /** A dependency- or proven resource-waiting workflow owns no productive slot. Require a fresh
    * Queue view AND explicit no-lease proof; unknown/stale/error states still count.
    * Never stop/restart a run or release its locks to make room. */
   private async productiveFeatureRuns(settings: CosSettings) {
@@ -386,7 +405,7 @@ export class ChiefOfStaff {
       const row = this.store.getTask(item.taskId);
       const deps = this.store.getSchedule(item.taskId).deps;
       let waiting = false;
-      if (row?.threadId && deps && deps.dependsOn.length > 0) {
+      if (row?.threadId && deps) {
         try {
           const view = await this.workflowsRpc<{ run?: ActiveRunView | null }>("workflowRunView", { threadId: row.threadId, runId: this.store.getTaskMeta(item.taskId)?.workflowRunId ?? null });
           const run = view?.run;
@@ -395,6 +414,7 @@ export class ChiefOfStaff {
             for (const dep of deps.dependsOn) {
               if (!(await this.dependencyDone(dep, repo))) { waiting = true; break; }
             }
+            if (!waiting) waiting = await runtimeHooks.hasFreshResourceWait(run.id);
             if (waiting) waiting = !(await runtimeHooks.hasWorkflowLease(run.id));
           }
         } catch { waiting = false; }

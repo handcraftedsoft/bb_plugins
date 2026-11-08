@@ -6,7 +6,7 @@ import {
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server";
-import { runtimeHooks } from "./runtime";
+import { runtimeHooks, isFreshResourceWait } from "./runtime";
 
 /** Existing git branch/worktree names the slug collision check sees. */
 let gitNamesInRepo: string[] = [];
@@ -17,6 +17,7 @@ runtimeHooks.featureMerged = async (_repo, slug) => mergedFeatures.includes(slug
 let leaseByRun: Record<string, string[]> = {};
 runtimeHooks.leaseResources = async (runId) => leaseByRun[runId] ?? null;
 runtimeHooks.hasWorkflowLease = async (runId) => runId in leaseByRun;
+runtimeHooks.hasFreshResourceWait = async () => false;
 
 interface FakeTask {
   id: number;
@@ -1357,29 +1358,41 @@ test("nonblocking QUESTION reports are not retried or nudged while waiting for a
   } finally { vi.useRealTimers(); await harness.lifecycle.dispose(); }
 });
 
-for (const scenario of ["dependency-wait", "held-lease", "lease-error", "build", "missing-view", "dependency-ready", "custom-workflow"]) {
+for (const scenario of ["dependency-wait", "held-lease", "lease-error", "build", "missing-view", "dependency-ready", "resource-wait", "resource-held", "resource-error", "custom-workflow"]) {
   test(`productive admission handles ${scenario} conservatively`, async () => {
+    leaseByRun = {};
     mergedFeatures = ["upstream"];
     const fake: FakeVikunja = { tasks: [{ id: 58, title: "Waiting routing", description: "feature: routing\nDepends-on: upstream\nResources: emulator", labels: ["feature"], assignees: ["CTO-bot"], bucketId: 16 }] };
     const { harness } = await makeHarness(fake, { maxFeatureRuns: 1, maxConcurrent: 1, ...(scenario === "custom-workflow" ? { workflowName: "custom" } : {}) });
     const leaseHook = runtimeHooks.hasWorkflowLease;
+    const resourceHook = runtimeHooks.hasFreshResourceWait;
     try {
       await syncNow(harness);
       expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
-      mergedFeatures = scenario === "dependency-ready" ? ["upstream"] : [];
+      mergedFeatures = scenario === "dependency-ready" || scenario.startsWith("resource-") ? ["upstream"] : [];
       if (scenario !== "missing-view") fake.runs = { th_w1: [{ id: "waiting_run", status: "running", currentPhase: scenario === "build" ? "Build" : "Queue" }] };
-      if (scenario === "held-lease") leaseByRun.waiting_run = [];
+      if (scenario === "held-lease" || scenario === "resource-held") leaseByRun.waiting_run = [];
+      if (scenario.startsWith("resource-")) runtimeHooks.hasFreshResourceWait = async () => { if (scenario === "resource-error") throw new Error("unreadable"); return true; };
       if (scenario === "lease-error") runtimeHooks.hasWorkflowLease = async () => { throw new Error("unreadable"); };
       fake.tasks.push(...[87, 88].map((id) => ({ id, title: id === 88 ? "URGENT: staging readiness" : "Health tab", description: `feature: work-${id}\nResources: none`, labels: ["feature"], assignees: ["CTO-bot"], bucketId: 16 })));
       await syncNow(harness);
       const spawns = harness.inspection.sdk.callsTo("threads.spawn");
-      expect(spawns).toHaveLength(scenario === "dependency-wait" ? 2 : 1);
-      if (scenario === "dependency-wait") {
+      expect(spawns).toHaveLength(["dependency-wait", "resource-wait"].includes(scenario) ? 2 : 1);
+      if (["dependency-wait", "resource-wait"].includes(scenario)) {
         expect(JSON.stringify(spawns[1])).toContain("staging readiness");
         const overview = await harness.behavior.callRpc("overview", null);
         expect(overview.tasks.find((t) => t.taskId === 87)?.state).toBe("paused");
       }
       expect(harness.inspection.sdk.callsTo("threads.stop")).toHaveLength(0);
-    } finally { runtimeHooks.hasWorkflowLease = leaseHook; await harness.lifecycle.dispose(); }
+    } finally { runtimeHooks.hasWorkflowLease = leaseHook; runtimeHooks.hasFreshResourceWait = resourceHook; await harness.lifecycle.dispose(); }
   });
 }
+
+
+test("resource wait proof rejects stale, mismatched and malformed queue records", () => {
+  const now = 1_000_000;
+  const valid = {runId:"run1",depsMet:true,blockedBy:"resource emulator",resources:["emulator"],seenAt:now-1000};
+  expect(isFreshResourceWait(valid,"run1",now)).toBe(true);
+  for (const patch of [{runId:"other"},{depsMet:false},{blockedBy:"slot cap"},{blockedBy:"resource emulator invalid"},{blockedBy:"resource ios-simulator"},{resources:[]},{resources:[4]},{seenAt:now-180001},{seenAt:now+1},{seenAt:"999000"},{seenAt:NaN}]) expect(isFreshResourceWait({...valid,...patch},"run1",now)).toBe(false);
+  expect(isFreshResourceWait(null,"run1",now)).toBe(false);
+});

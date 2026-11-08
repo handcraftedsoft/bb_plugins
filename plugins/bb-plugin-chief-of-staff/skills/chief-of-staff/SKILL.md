@@ -6,9 +6,11 @@ description: Drive the Chief of Staff with the bb chief command — it runs Viku
 ## Current workflow safety and scheduling
 
 For the `feature-delivery` workflow, CoS dispatch gates only on hard dependencies
-and the productive-run cap. A workflow with a fresh Queue status, an unmet hard
-dependency and verified absence of any lease does not consume a productive run
-or worker slot. Missing status, unreadable lease state, held leases and custom
+and the productive-run cap. A workflow with a fresh Queue status and verified absence of any lease does not
+consume a productive run or worker slot when it has an unmet hard dependency, or
+a matching resource-wait queue record updated within 180 seconds. Resource-wait
+proof must name the same run, show depsMet=true and a nonempty resource list;
+missing, malformed, stale, future-dated and unreadable records remain counted. Missing status, unreadable lease state, held leases and custom
 workflows remain conservatively counted. Urgent-prefixed tasks are admitted
 before other ready tasks, without preemption. The workflow's atomic lease cap
 still governs actual execution. It records resource needs for visibility, but the workflow owns
