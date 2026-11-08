@@ -6,7 +6,12 @@ description: Drive the Chief of Staff with the bb chief command — it runs Viku
 ## Current workflow safety and scheduling
 
 For the `feature-delivery` workflow, CoS dispatch gates only on hard dependencies
-and the run cap. It records resource needs for visibility, but the workflow owns
+and the productive-run cap. A workflow with a fresh Queue status, an unmet hard
+dependency and verified absence of any lease does not consume a productive run
+or worker slot. Missing status, unreadable lease state, held leases and custom
+workflows remain conservatively counted. Urgent-prefixed tasks are admitted
+before other ready tasks, without preemption. The workflow's atomic lease cap
+still governs actual execution. It records resource needs for visibility, but the workflow owns
 exclusive resource leases when Build/test needs them. This allows a second mobile
 Spec while another run owns the emulator. Custom workflow names keep conservative
 CoS resource gating. Roll out together with feature-delivery's phase-scoped lease

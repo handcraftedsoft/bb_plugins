@@ -139,13 +139,36 @@ async function leaseResources(runId: string): Promise<string[] | null> {
   return null;
 }
 
+/** Check lease existence without treating read/parse failures as proof of absence.
+ * Includes legacy lock files; the workflow remains the authoritative atomic cap. */
+async function hasWorkflowLease(runId: string): Promise<boolean> {
+  const dir = join(homedir(), ".bb", "locks");
+  const entries = await readdir(dir);
+  const file = runId.replace(/[^A-Za-z0-9_.:-]/g, "_") + ".json";
+  const candidates = new Set(["rateyourfood-feature-delivery.lock"]);
+  for (const entry of entries.filter((name) => name.endsWith(".leases"))) {
+    candidates.add(entry);
+    candidates.add(entry.slice(0, -".leases".length));
+  }
+  for (const entry of candidates) {
+    try {
+      const lease = JSON.parse(await readFile(join(dir, entry, ...(entry.endsWith(".leases") ? [file] : [])), "utf8"));
+      if (entry.endsWith(".leases") || lease.runId === runId) return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return false;
+}
+
 /** Test seams: existing branch/worktree names; whether a feature is merged to main;
  * the resources a workflow run's live lease holds. */
 export const runtimeHooks: {
   gitNames: (repo: string) => Promise<string[]>;
   featureMerged: (repo: string, slug: string) => Promise<boolean>;
   leaseResources: (runId: string) => Promise<string[] | null>;
-} = { gitNames, featureMerged, leaseResources };
+  hasWorkflowLease: (runId: string) => Promise<boolean>;
+} = { gitNames, featureMerged, leaseResources, hasWorkflowLease };
 
 /** Error prefix for a paused feature task that keeps its worker thread but is
  * held back by the scheduler (resource / cap); the sweep resumes it when eligible. */
@@ -352,6 +375,35 @@ export class ChiefOfStaff {
     }
   }
 
+  /** A dependency-waiting workflow owns no productive slot. Require a fresh
+   * Queue view AND explicit no-lease proof; unknown/stale/error states still count.
+   * Never stop/restart a run or release its locks to make room. */
+  private async productiveFeatureRuns(settings: CosSettings) {
+    const active = this.store.activeFeatureRuns();
+    if (settings.workflowName !== "feature-delivery") return active;
+    const productive = [];
+    for (const item of active) {
+      const row = this.store.getTask(item.taskId);
+      const deps = this.store.getSchedule(item.taskId).deps;
+      let waiting = false;
+      if (row?.threadId && deps && deps.dependsOn.length > 0) {
+        try {
+          const view = await this.workflowsRpc<{ run?: ActiveRunView | null }>("workflowRunView", { threadId: row.threadId, runId: this.store.getTaskMeta(item.taskId)?.workflowRunId ?? null });
+          const run = view?.run;
+          if (run && (run.status === "running" || run.status === "queued") && run.currentPhase === "Queue") {
+            const repo = await this.projectRepo(settings.project);
+            for (const dep of deps.dependsOn) {
+              if (!(await this.dependencyDone(dep, repo))) { waiting = true; break; }
+            }
+            if (waiting) waiting = !(await runtimeHooks.hasWorkflowLease(run.id));
+          }
+        } catch { waiting = false; }
+      }
+      if (!waiting) productive.push(item);
+    }
+    return productive;
+  }
+
   /** Hard deps merged, shared resources free, slot under the cap? Soft deps never block. */
   private async scheduleFeature(task: VikunjaTask, meta: TaskMeta, settings: CosSettings) {
     const deps = this.depsFor(task, meta);
@@ -360,7 +412,7 @@ export class ChiefOfStaff {
     for (const slug of deps.dependsOn) done.set(slug, await this.dependencyDone(slug, repo));
     const decision = schedulingDecision({
       deps,
-      active: this.store.activeFeatureRuns().filter((run) => run.taskId !== task.id),
+      active: (await this.productiveFeatureRuns(settings)).filter((run) => run.taskId !== task.id),
       maxFeatureRuns: settings.maxFeatureRuns,
       resourcesManagedByWorkflow: settings.workflowName === "feature-delivery",
       depDone: (slug) => done.get(slug) === true,
@@ -421,12 +473,12 @@ export class ChiefOfStaff {
 
   /** Scheduling for a task that already has a worker thread (frozen deps):
    * its hard deps were met at dispatch, so only resources and the cap count. */
-  private scheduleHeld(taskId: number, settings: CosSettings) {
+  private async scheduleHeld(taskId: number, settings: CosSettings) {
     const deps = this.store.getSchedule(taskId).deps;
     if (deps === null) return { eligible: true, layer: null, reason: null } as const;
     return schedulingDecision({
       deps: { ...deps, dependsOn: [] },
-      active: this.store.activeFeatureRuns().filter((run) => run.taskId !== taskId),
+      active: (await this.productiveFeatureRuns(settings)).filter((run) => run.taskId !== taskId),
       maxFeatureRuns: settings.maxFeatureRuns,
       resourcesManagedByWorkflow: settings.workflowName === "feature-delivery",
       depDone: () => true,
@@ -719,7 +771,9 @@ export class ChiefOfStaff {
         return;
       }
     }
-    const active = this.store.listTasksWithState("active").length;
+    const productive = await this.productiveFeatureRuns(settings);
+    const waitingFeatures = this.store.activeFeatureRuns().length - productive.length;
+    const active = this.store.listTasksWithState("active").length - waitingFeatures;
     if (active >= settings.maxConcurrent) {
       this.store.upsertTask(
         { taskId: task.id, title: task.title, projectId: task.projectId, lastTaskUpdated: task.updated },
@@ -1202,7 +1256,7 @@ export class ChiefOfStaff {
 
   /** A feature driver held back by the scheduler continues once its resources are free. */
   private async resumeIfEligible(taskId: number, threadId: string, settings: CosSettings): Promise<void> {
-    const decision = this.scheduleHeld(taskId, settings);
+    const decision = await this.scheduleHeld(taskId, settings);
     if (!decision.eligible) {
       if (this.store.getSchedule(taskId).blockReason !== decision.reason) {
         this.store.setSchedule(taskId, { blockReason: decision.reason });
@@ -1238,7 +1292,7 @@ export class ChiefOfStaff {
       if (this.store.getTaskMeta(taskId)?.mode === "feature") {
         // Never resume a feature driver beside a run holding its (or a conflicting) resource.
         await this.recordLeaseResources();
-        const decision = this.scheduleHeld(taskId, await this.readSettings());
+        const decision = await this.scheduleHeld(taskId, await this.readSettings());
         if (!decision.eligible) {
           const updated = this.store.updateTask(taskId, { error: SCHEDULER_HOLD + decision.reason! })!;
           this.store.setSchedule(taskId, { blockReason: decision.reason });
@@ -1357,7 +1411,9 @@ export class ChiefOfStaff {
       }
       await this.recordLeaseResources();
 
-      for (const task of tasks) {
+      // Stable urgent-first admission; never preempt existing workers.
+      const admissionOrder = [...tasks].sort((a, b) => Number(/^URGENT\b/i.test(b.title)) - Number(/^URGENT\b/i.test(a.title)));
+      for (const task of admissionOrder) {
         const row = this.store.getTask(task.id);
         if (row === null || row.threadId === null) {
           await this.introduceTask(task, settings);
