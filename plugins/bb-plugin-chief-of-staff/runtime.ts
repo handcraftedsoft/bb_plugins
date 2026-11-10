@@ -347,6 +347,7 @@ export class ChiefOfStaff {
       feature: meta.feature,
       deployRequested: meta.deployRequested,
       workflowName: settings.workflowName,
+      maxFeatureRuns: settings.maxFeatureRuns,
     };
   }
 
@@ -399,12 +400,22 @@ export class ChiefOfStaff {
    * Never stop/restart a run or release its locks to make room. */
   private async productiveFeatureRuns(settings: CosSettings) {
     const active = this.store.activeFeatureRuns();
+    // A failed pause is not proof that its workflow stopped: retain its admission slot.
+    for (const row of this.store.listTasksWithState("paused")) {
+      const meta = this.store.getTaskMeta(row.taskId);
+      if (row.threadId && meta?.mode === "feature" && row.error?.startsWith("pause incomplete:")) {
+        active.push({ taskId: row.taskId, feature: meta.feature, resources: this.store.getSchedule(row.taskId).deps?.resources ?? [] });
+      }
+    }
+    // Strict serial means one admitted task, including a leaseless Queue waiter.
+    if (settings.maxFeatureRuns === 1) return active;
     if (settings.workflowName !== "feature-delivery") return active;
     const productive = [];
     for (const item of active) {
       const row = this.store.getTask(item.taskId);
       const deps = this.store.getSchedule(item.taskId).deps;
       let waiting = false;
+      if (row?.state === "paused") { productive.push(item); continue; }
       if (row?.threadId && deps) {
         try {
           const view = await this.workflowsRpc<{ run?: ActiveRunView | null }>("workflowRunView", { threadId: row.threadId, runId: this.store.getTaskMeta(item.taskId)?.workflowRunId ?? null });
@@ -495,7 +506,7 @@ export class ChiefOfStaff {
    * its hard deps were met at dispatch, so only resources and the cap count. */
   private async scheduleHeld(taskId: number, settings: CosSettings) {
     const deps = this.store.getSchedule(taskId).deps;
-    if (deps === null) return { eligible: true, layer: null, reason: null } as const;
+    if (deps === null) return { eligible: false, layer: "hard", reason: "missing frozen scheduling evidence; sync task before resuming" } as const;
     return schedulingDecision({
       deps: { ...deps, dependsOn: [] },
       active: (await this.productiveFeatureRuns(settings)).filter((run) => run.taskId !== taskId),
@@ -1030,6 +1041,7 @@ export class ChiefOfStaff {
     if (task === null) {
       return "This thread is not a Chief of Staff worker; the report was ignored.";
     }
+    if (task.state === "paused") return `Task #${task.taskId} is paused; late worker report ignored. Resume explicitly before reporting task execution.`;
     const now = Date.now();
     const trimmed = note?.trim() ?? null;
     let meta = this.store.getTaskMeta(task.taskId);
@@ -1154,16 +1166,17 @@ export class ChiefOfStaff {
   private async activeRunsForThread(threadId: string): Promise<ActiveRunView[] | null> {
     try {
       const result = await this.workflowsRpc<{ runs?: unknown }>("workflowActiveRuns", { threadId });
-      const runs = Array.isArray(result?.runs) ? result.runs : [];
-      return runs
-        .filter((run): run is { id: string; status?: unknown; currentPhase?: unknown } =>
-          typeof run === "object" && run !== null && typeof (run as { id?: unknown }).id === "string")
-        .map((run) => ({
-          id: run.id,
-          status: typeof run.status === "string" ? run.status : "unknown",
-          currentPhase: typeof run.currentPhase === "string" ? run.currentPhase : null,
-        }))
-        .filter((run) => run.status === "queued" || run.status === "running");
+      if (!Array.isArray(result?.runs)) throw new Error("malformed workflowActiveRuns response");
+      const runs: ActiveRunView[] = [];
+      for (const value of result.runs) {
+        if (typeof value !== "object" || value === null) throw new Error("malformed active run");
+        const run = value as { id?: unknown; status?: unknown; currentPhase?: unknown };
+        if (typeof run.id !== "string" || !run.id.trim() || typeof run.status !== "string" ||
+            !["queued", "running", "succeeded", "failed", "cancelled"].includes(run.status) ||
+            (run.currentPhase !== null && typeof run.currentPhase !== "string")) throw new Error("malformed active run");
+        if (run.status === "queued" || run.status === "running") runs.push({id:run.id,status:run.status,currentPhase:run.currentPhase});
+      }
+      return runs;
     } catch (cause) {
       this.bb.log.warn(`active runs for ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`);
       return null;
@@ -1266,11 +1279,31 @@ export class ChiefOfStaff {
   async pauseTask(taskId: number): Promise<TaskRow | null> {
     const task = this.store.getTask(taskId);
     if (task === null) return null;
-    if (task.state !== "active") throw new Error(`Task #${taskId} is ${task.state}; only active tasks can pause`);
-    if (task.threadId !== null) await this.stopThreadQuietly(task.threadId);
-    const updated = this.store.updateTask(taskId, { state: "paused", stalled: 0, error: null })!;
+    if (task.state !== "active" && task.state !== "paused") throw new Error(`Task #${taskId} is ${task.state}; only active or paused tasks can pause`);
+    // Persist FIRST: cancellation emits terminal notifications that can otherwise restart the driver.
+    this.store.updateTask(taskId, {state:"paused",stalled:0,error:"pause incomplete: stopping worker and workflows",progressNote:"paused by user",progressAt:Date.now()});
+    this.store.setSchedule(taskId, {blockReason:null});
+    const errors: string[] = [];
+    if (task.threadId !== null) {
+      const runs = await this.activeRunsForThread(task.threadId);
+      if (runs === null) errors.push("cannot verify active workflows");
+      else for (const run of runs) {
+        try { await this.workflowsRpc("workflowStopRun", {threadId:task.threadId,runId:run.id}); }
+        catch (cause) { errors.push(`stop ${run.id}: ${cause instanceof Error ? cause.message : String(cause)}`); }
+      }
+      try {
+        await this.bb.sdk.threads.stop({threadId:task.threadId});
+        const thread = await this.bb.sdk.threads.get({threadId:task.threadId});
+        if (thread.status !== "idle" && thread.status !== "error") errors.push(`worker stop unconfirmed (${thread.status})`);
+      } catch (cause) { errors.push(`worker stop: ${cause instanceof Error ? cause.message : String(cause)}`); }
+      const remaining = await this.activeRunsForThread(task.threadId);
+      if (remaining === null) errors.push("cannot verify cancellation");
+      else if (remaining.length) errors.push(`workflows still active: ${remaining.map(r=>r.id).join(", ")}`);
+    }
+    const updated = this.store.updateTask(taskId, {error:errors.length ? "pause incomplete: " + errors.join("; ") : null})!;
     await this.refreshBriefing();
     this.publish();
+    if (errors.length) throw new Error(`Task #${taskId} remains paused, but stopping is NOT confirmed: ${errors.join("; ")}. Retry pause; do not admit replacement work.`);
     return updated;
   }
 
@@ -1289,10 +1322,8 @@ export class ChiefOfStaff {
       this.store.updateTask(taskId, { threadId: null, state: "paused", error: "worker thread is gone" });
       return;
     }
-    await this.sendToThread(
-      threadId,
-      "The resources this task needs are free now (the Chief of Staff held it back while a conflicting run used the device). Continue now: check your workflow run with `bb workflows status`; if it is not running, launch ONE fresh run, and report 'progress' with its run id.",
-    );
+    const prior = this.store.getTask(taskId)!;
+    const priorReason = this.store.getSchedule(taskId).blockReason;
     this.store.setSchedule(taskId, { blockReason: null });
     this.store.updateTask(taskId, {
       state: "active",
@@ -1302,19 +1333,31 @@ export class ChiefOfStaff {
       nudgeCount: 0,
       error: null,
     });
+    try {
+      await this.sendToThread(
+        threadId,
+        "The resources this task needs are free now (the Chief of Staff held it back while a conflicting run used the device). Continue now: check your workflow run with `bb workflows status`; if it is not running, read its result and follow its nextAction (resume-final-candidate uses the exact last args plus resumeFinalCandidate:true, never Build replay). Only then launch ONE permitted fresh run, and report 'progress' with its run id.",
+      );
+    } catch (cause) {
+      this.store.updateTask(taskId, prior);
+      this.store.setSchedule(taskId, {blockReason:priorReason});
+      throw cause;
+    }
   }
 
   async resumeTask(taskId: number): Promise<TaskRow | null> {
     const task = this.store.getTask(taskId);
     if (task === null) return null;
     if (task.state !== "paused") throw new Error(`Task #${taskId} is ${task.state}; only paused tasks can resume`);
+    const priorReason = this.store.getSchedule(taskId).blockReason;
+    if (task.error?.startsWith("pause incomplete:")) throw new Error(`Task #${taskId} stop is unconfirmed; retry pause before resuming`);
     if (task.threadId !== null && (await this.threadAlive(task.threadId)) !== null) {
       if (this.store.getTaskMeta(taskId)?.mode === "feature") {
         // Never resume a feature driver beside a run holding its (or a conflicting) resource.
         await this.recordLeaseResources();
         const decision = await this.scheduleHeld(taskId, await this.readSettings());
         if (!decision.eligible) {
-          const updated = this.store.updateTask(taskId, { error: SCHEDULER_HOLD + decision.reason! })!;
+          const updated = this.store.updateTask(taskId, { error: SCHEDULER_HOLD + decision.reason!, progressNote: "resume requested; waiting for admission" })!;
           this.store.setSchedule(taskId, { blockReason: decision.reason });
           await this.refreshBriefing();
           this.publish();
@@ -1322,10 +1365,6 @@ export class ChiefOfStaff {
         }
         this.store.setSchedule(taskId, { blockReason: null });
       }
-      await this.sendToThread(
-        task.threadId,
-        "The user resumed this task. Continue working on it now, starting with a chief_of_staff_report stage 'progress' note on where you left off.",
-      );
       const updated = this.store.updateTask(taskId, {
         state: "active",
         progressNote: "resumed",
@@ -1334,12 +1373,22 @@ export class ChiefOfStaff {
         nudgeCount: 0,
         error: null,
       })!;
+      try {
+        await this.sendToThread(
+          task.threadId,
+          "The user resumed this task. Continue working on it now, starting with a chief_of_staff_report stage 'progress' note on where you left off.",
+        );
+      } catch (cause) {
+        this.store.updateTask(taskId, task);
+        this.store.setSchedule(taskId, {blockReason:priorReason});
+        throw cause;
+      }
       await this.refreshBriefing();
       this.publish();
       return updated;
     }
     // No usable thread: clear it and let the next sweep reintroduce the task.
-    const updated = this.store.updateTask(taskId, { threadId: null })!;
+    const updated = this.store.updateTask(taskId, { threadId: null, state: "active", progressNote: "resumed", error: null })!;
     await this.sweep();
     return this.store.getTask(taskId) ?? updated;
   }
@@ -1374,7 +1423,7 @@ export class ChiefOfStaff {
     if (task === null) return;
     if (task.state === "active") {
       this.store.updateTask(task.taskId, { threadId: null, error: `worker thread ${why}` });
-    } else if (task.state === "paused") {
+    } else if (task.state === "paused" && !task.error?.startsWith("pause incomplete:")) {
       this.store.updateTask(task.taskId, { threadId: null });
     }
     // Its questions can no longer be answered through the tool.
@@ -1431,10 +1480,16 @@ export class ChiefOfStaff {
       }
       await this.recordLeaseResources();
 
-      // Stable urgent-first admission; never preempt existing workers.
-      const admissionOrder = [...tasks].sort((a, b) => Number(/^URGENT\b/i.test(b.title)) - Number(/^URGENT\b/i.test(a.title)));
+      // Stable urgent-first admission, then already-integrated final candidates; never preempt.
+      const finalCandidate = (id: number) => {
+        const meta = this.store.getTaskMeta(id);
+        return meta?.workflowStatus === "queue-timeout" && meta.workflowPhase === "Merge";
+      };
+      const admissionOrder = [...tasks].sort((a, b) => Number(/^URGENT\b/i.test(b.title)) - Number(/^URGENT\b/i.test(a.title)) || Number(finalCandidate(b.id)) - Number(finalCandidate(a.id)));
       for (const task of admissionOrder) {
         const row = this.store.getTask(task.id);
+        // A manual pause survives thread deletion and never becomes scheduler eligibility.
+        if (row?.state === "paused" && (row.progressNote === "paused by user" || row.error?.startsWith("pause incomplete:"))) continue;
         if (row === null || row.threadId === null) {
           await this.introduceTask(task, settings);
           continue;

@@ -719,6 +719,7 @@ export function workflowPhaseFromTimeline(payload: unknown): string | null {
 }
 
 export interface WorkerPlan {
+  maxFeatureRuns?: number;
   mode: TaskMode;
   feature: string | null;
   deployRequested: boolean;
@@ -977,7 +978,7 @@ export function schedulingDecision(input: SchedulingInput): SchedulingDecision {
 }
 
 /** The workflow args for a feature task, frozen at dispatch so --resume replays. */
-export function featureArgs(task: Pick<VikunjaTask, "id" | "title" | "description">, meta: Pick<TaskMeta, "feature" | "deployRequested">): Record<string, unknown> {
+export function featureArgs(task: Pick<VikunjaTask, "id" | "title" | "description">, meta: Pick<TaskMeta, "feature" | "deployRequested"> & {maxFeatureRuns?: number}): Record<string, unknown> {
   const detail = plainDescription(task.description);
   const feature = meta.feature ?? slugFeature(task.title);
   const deps = classifyDependencies(task, feature);
@@ -992,6 +993,7 @@ export function featureArgs(task: Pick<VikunjaTask, "id" | "title" | "descriptio
     // Codex cost savings A–E: first dispatch is Spec round 1. Driver bumps only on a true fresh Spec
     // (not continueRepair). Cap: MAX_SPEC_ROUNDS.
     specRound: 1,
+    maxParallelRuns: meta.maxFeatureRuns ?? 1,
   };
 }
 
@@ -1027,7 +1029,9 @@ export function buildWorkerPrompt(
       `   - nextAction "approve": the spec flagged irreversible/high-impact work. Use the QUESTION handoff with kind irreversible, the result's approvalReasons and report as context, options ["Approve", "Revise: <notes>", "Cancel"]. Approve → re-run with the SAME args plus "approved": true and --resume <run-id> (write ${argsFile.replace(".json", "-approved.json")} once from the frozen file with approved:true added). Revise → a new run whose brief is the frozen brief plus the notes (this IS a fresh Spec: bump specRound by 1, omit continueRepair; if the new specRound would exceed MAX_SPEC_ROUNDS (3), do NOT Spec — report blocked with remaining reasons and ask Denis). Cancel → report "failed" with "cancelled by Denis".`,
       `   - status "${plan.deployRequested ? "delivered" : "merged-to-main"}": report "done" with workflowRunId and workflowStatus.`,
       `   - status "lane-less-blocked" or legacy "nothing-to-build": report "blocked" with the reason. No app lanes is not completion: documentation must still be implemented, independently checked and merged. Do not rerun a fresh Spec blindly or mark the task done.`,
-      `   - status "queue-timeout" (nextAction "rerun"): nothing was started; start ONE fresh run with the same frozen args (same specRound).`,
+      `   - nextAction "resume-final-candidate": lane work is complete but final acceptance is PENDING, NOT delivered. Start ONE fresh run from the exact args of the run that timed out (including its continuation/approval fields), adding only resumeFinalCandidate:true. Do NOT use cached --resume, reconstruct a missing checkpoint, replay Build or drop final gates. If paused, do not launch anything until explicitly resumed.`,
+      `   - status "candidate-checkpoint-invalid": report "blocked" with its exact reason and stop. Never fall back to Build or a fresh Spec automatically.`,
+      `   - status "queue-timeout" with nextAction "rerun" only: start ONE fresh run with the same args as that run (same specRound), only while admitted and not paused. Never claim this timeout delivered anything.`,
       `   - nextAction "continue-repair" (or status "partial" with repairIssues, or status "main-merge-failed" with mergeConflict / nextAction continue-repair, or after YOU as manager adopted/fixed process or lane-ownership review findings on the integration branch): DO NOT launch a fresh Spec and DO NOT stuff findings into a new brief. Write ${argsFile.replace(".json", "-continue.json")} from the frozen args plus continueRepair:true, repairIssues from the result (map of app -> finding strings; after manager adoption, list the findings you just closed / "re-verify manager adoption on integration"), and the SAME specRound; when the result has mergeConflict or mergeConflictRepair, ALSO set mergeConflictRepair:true and copy mergeConflict from the result. Run bb workflows run --name ${plan.workflowName} --args "$(cat that file)". Resume on the existing branch: review findings → repair→verify→review; main-merge conflict → resolve on integration + re-checks; manager-adopted process MAJORs → re-verify/re-review only (no lane rebuild, no fresh Spec).`,
       `   - status "spec-rounds-exhausted" (nextAction "pause"): already used 3 fresh Spec launches for this ticket. Report "blocked", surface remaining MAJORs (result.report + repairIssues) through the QUESTION handoff; do NOT burn another Spec. Options: continueRepair on the existing branch if findings are repairable, hand to Denis, or cancel.`,
       `   - Fresh Spec only on: first attempt, true scope change (Denis revise notes / explicit new scope), or explicit new ticket. NEVER start a fresh Spec solely because of a main merge conflict — that is continue-repair / mergeConflictRepair. NEVER start a fresh Spec solely because the manager (you) patched process / lane-ownership MAJORs on the integration branch (manager adoption) — that is continue-repair (re-verify/re-review, same specRound). When older notes say "manager fixes + ONE FRESH run", that means one continueRepair run on the existing branch, NOT a new Codex Spec. When you must Spec again (not continue-repair): bump specRound by 1 in a new args file (omit continueRepair/repairIssues/mergeConflictRepair/mergeConflict). If new specRound > 3, pause as above instead.`,

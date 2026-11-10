@@ -5,19 +5,40 @@ description: Drive the Chief of Staff with the bb chief command — it runs Viku
 
 ## Current workflow safety and scheduling
 
-For the `feature-delivery` workflow, CoS dispatch gates only on hard dependencies
-and the productive-run cap. A workflow with a fresh Queue status and verified absence of any lease does not
-consume a productive run or worker slot when it has an unmet hard dependency, or
-a matching resource-wait queue record updated within 180 seconds. Resource-wait
-proof must name the same run, show depsMet=true and a nonempty resource list;
-missing, malformed, stale, future-dated and unreadable records remain counted. Missing status, unreadable lease state, held leases and custom
-workflows remain conservatively counted. Urgent-prefixed tasks are admitted
-before other ready tasks, without preemption. The workflow's atomic lease cap
-still governs actual execution. It records resource needs for visibility, but the workflow owns
-exclusive resource leases when Build/test needs them. This allows a second mobile
-Spec while another run owns the emulator. Custom workflow names keep conservative
-CoS resource gating. Roll out together with feature-delivery's phase-scoped lease
-change; never bypass the workflow's device lock manually.
+The defaults are `maxConcurrent=1` and `maxFeatureRuns=1`: finish one admitted task
+before admitting another, including a queued workflow with no resource lease. Existing
+stored settings are not migrated by a source update; set both values to 1 in the plugin
+settings when activating serial operation. Feature dispatch freezes `maxParallelRuns`
+from `maxFeatureRuns` into its workflow args (default 1). This is scheduler admission,
+not a universal host limit: directly launched workflows and old frozen args can bypass
+CoS; the workflow's atomic run-slot/resource helper remains the execution gate.
+
+With an explicit larger cap only, a fresh Queue workflow with verified no lease may
+release its productive slot for a proven hard-dependency or fresh resource wait. Missing
+or corrupt evidence remains counted. Urgent tasks go first, followed by previously
+integrated candidates waiting for final acceptance, without preempting admitted work.
+Custom workflow names retain conservative resource gating. Never remove leases or
+restart active runs to create room.
+
+`bb chief pause <task>` persists the pause before stopping durable workflows and the
+driver, then verifies no queued/running workflows and a stopped driver remain. Failure
+is reported as `pause incomplete`; the row stays paused and retains its admission slot.
+Retry pause to finish cancellation; do not resume or admit a replacement on uncertainty.
+Manual pauses never auto-resume, even after thread deletion. Only explicit resume may
+request scheduler admission, and failed resume delivery restores the paused state.
+
+While paused, a synchronous SDK dispatch guard rejects automatic system/agent/mixed
+messages and retry drains for the tracked driver and verified direct children. Direct
+user questions remain allowed with instructions forbidding task execution until resumed.
+Late reports cannot erase the pause. This is not a process-tree kill: deeper/unmapped
+threads are not guessed from titles, and the host's explicit user Send-now override bypasses
+hooks. Durable workflow cancellation handles workflow workers; unrelated/manual processes
+are outside this guard. Disabling the plugin also disables its dispatch hook.
+
+For `nextAction=resume-final-candidate`, report final acceptance as pending, not delivered.
+Use a fresh workflow with the exact last-run args plus `resumeFinalCandidate:true`, never
+cached `--resume`, Build replay or reconstructed evidence. `candidate-checkpoint-invalid`
+stays blocked for inspection. While paused, even this recovery waits for explicit resume.
 
 Do not use `chief_of_staff_ask` for new worker questions: its long-held connection
 is unreliable. Report stage `blocked` with a first line of:
@@ -69,7 +90,7 @@ bb chief sync                    # poll Vikunja now and reconcile workers
 bb chief brief --refresh         # decisions, in flight, stalled, completed
 bb chief decisions               # pending decisions first, with ids
 bb chief answer <decision-id> "Use the existing auth middleware" --remember "auth,middleware"
-bb chief pause 7                 # stop a task's worker (task id from Vikunja)
+bb chief pause 7                 # pause driver + durable workflows; verify cancellation
 bb chief resume 7
 bb chief policy list             # keyword → auto-answer rules
 bb chief policy add deploy "Ship behind the feature flag; never enable by default."
@@ -104,7 +125,7 @@ Operating constraints:
   mentions ("deploy script", "push notifications") mean NO — write
   `Deploy: no` / `Deploy: yes` in task descriptions to be unambiguous. At most
   `maxFeatureRuns` (default 1) feature runs at once; the workflow also enforces
-  one run at a time with a project lock, so a run in phase `Queue` ("queued
+  its configured atomic slot cap and resource leases, so a run in phase `Queue` ("queued
   behind <run id>") is waiting normally and must not be restarted. Other tasks get a plain
   implementer (ZCode GLM-5.3) that merges its worktree branch into local main
   once tests pass.

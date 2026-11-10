@@ -141,14 +141,14 @@ export type BriefingView = z.infer<typeof briefingViewSchema>;
 const DEFAULTS: CosSettings = {
   project: "proj_jjitzuscx6",
   assignee: "CTO-bot",
-  maxConcurrent: 3,
+  maxConcurrent: 1,
   stallMinutes: 30,
   maxNudges: 2,
   pollSeconds: 60,
   decisionTimeoutHours: 24,
   featureLabel: "feature",
   workflowName: "feature-delivery",
-  maxFeatureRuns: 3,
+  maxFeatureRuns: 1,
   workerProvider: "zcode",
   featureWorkerModel: "account:zai-individual-coding-plan/GLM-5.3-Flash",
   taskWorkerModel: "account:zai-individual-coding-plan/GLM-5.3",
@@ -298,6 +298,16 @@ export default async function plugin(bb: BbPluginApi) {
   bb.storage.migrate(db, SCHEMA);
   const store = new ChiefStore(db);
   const chief = new ChiefOfStaff(bb, store, readSettings);
+  // Synchronous persisted lookup: even cancellation notifications and retry drains see the pause.
+  // Only verified origin/direct-parent mappings are covered; never guess from titles or metadata.
+  bb.experimental_hooks.on("message.dispatch", (context) => {
+    const task = store.taskByThreadId(context.thread.id) ??
+      (context.parentThreadId ? store.taskByThreadId(context.parentThreadId) : null);
+    if (task?.state === "paused" && context.initiator !== "user") {
+      return {action:"reject",message:`Task #${task.taskId} is paused. Automatic dispatch is disabled; use chief resume explicitly.`};
+    }
+    return {action:"proceed"};
+  });
 
   /** Board writes from the panel/CLI land here so briefings and panels update. */
   async function boardChanged(): Promise<void> {
@@ -371,6 +381,9 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.configure((context) => {
+    const paused = store.taskByThreadId(context.thread.id) ??
+      (context.thread.parentThreadId ? store.taskByThreadId(context.thread.parentThreadId) : null);
+    if (paused?.state === "paused") return {tools:[],skills:[],instructions:`Task #${paused.taskId} is PAUSED. Answer direct user questions only. Do not restart work, workflows, tests, child agents or automatic retries. Ask the user to resume through chief resume before continuing task execution.`};
     const itemId = context.pluginMetadata.itemId;
     if (typeof itemId !== "string" || itemId === "") {
       return { tools: [], skills: [] };

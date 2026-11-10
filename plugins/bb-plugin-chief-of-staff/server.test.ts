@@ -3,6 +3,7 @@ import {
   createFakePluginHost,
   experimental_scanPublicSdkOnly,
   makePluginAgentConfigurationContext,
+  makeMessageDispatchHookContext,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server";
@@ -73,6 +74,10 @@ interface FakeVikunja {
   runs?: Record<string, FakeRun[]>;
   /** Makes the single-task Vikunja lookup (`id = N`) fail. */
   lookupError?: boolean;
+  activeRunsResponse?: unknown;
+  stopRunError?: boolean;
+  keepRunActive?: boolean;
+  onStopRun?: () => Promise<void>;
 }
 
 interface FakeRun {
@@ -106,7 +111,7 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
   const workflowCalls: Array<{ method: string; input: unknown }> = [];
   const { bb, harness } = createFakePluginHost({
     pluginId: "chief-of-staff",
-    settings: { project: "proj_jjitzuscx6", assignee: "CTO-bot", ...settings },
+    settings: { project: "proj_jjitzuscx6", assignee: "CTO-bot", maxFeatureRuns: 3, maxConcurrent: 3, ...settings },
     sdk: {
       plugins: {
         callRpc: async (args: { pluginId?: string; method: string; input: unknown }) => {
@@ -115,6 +120,7 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
             workflowCalls.push({ method: args.method, input: args.input });
             const runs = fake.runs?.[String(input?.threadId)] ?? [];
             if (args.method === "workflowActiveRuns") {
+              if ("activeRunsResponse" in fake) return fake.activeRunsResponse;
               return { runs: runs.filter((run) => run.status === "queued" || run.status === "running") };
             }
             if (args.method === "workflowRunView") {
@@ -124,9 +130,11 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
               return { run };
             }
             if (args.method === "workflowStopRun") {
+              await fake.onStopRun?.();
+              if (fake.stopRunError) throw new Error("fake cancellation failure");
               const run = runs.find((entry) => entry.id === input?.runId);
               if (run === undefined) throw new Error("This workflow run is not available in this thread");
-              run.status = "cancelled";
+              if (!fake.keepRunActive) run.status = "cancelled";
               return { stopped: true, run };
             }
             throw new Error(`unexpected workflows rpc: ${args.method}`);
@@ -1358,12 +1366,12 @@ test("nonblocking QUESTION reports are not retried or nudged while waiting for a
   } finally { vi.useRealTimers(); await harness.lifecycle.dispose(); }
 });
 
-for (const scenario of ["dependency-wait", "held-lease", "lease-error", "build", "missing-view", "dependency-ready", "resource-wait", "resource-held", "resource-error", "custom-workflow"]) {
-  test(`productive admission handles ${scenario} conservatively`, async () => {
+for (const cap of [1, 2]) for (const scenario of ["dependency-wait", "held-lease", "lease-error", "build", "missing-view", "dependency-ready", "resource-wait", "resource-held", "resource-error", "custom-workflow"]) {
+  test(`productive admission cap ${cap} handles ${scenario} conservatively`, async () => {
     leaseByRun = {};
     mergedFeatures = ["upstream"];
     const fake: FakeVikunja = { tasks: [{ id: 58, title: "Waiting routing", description: "feature: routing\nDepends-on: upstream\nResources: emulator", labels: ["feature"], assignees: ["CTO-bot"], bucketId: 16 }] };
-    const { harness } = await makeHarness(fake, { maxFeatureRuns: 1, maxConcurrent: 1, ...(scenario === "custom-workflow" ? { workflowName: "custom" } : {}) });
+    const { harness } = await makeHarness(fake, { maxFeatureRuns: cap, maxConcurrent: 1, ...(scenario === "custom-workflow" ? { workflowName: "custom" } : {}) });
     const leaseHook = runtimeHooks.hasWorkflowLease;
     const resourceHook = runtimeHooks.hasFreshResourceWait;
     try {
@@ -1377,8 +1385,8 @@ for (const scenario of ["dependency-wait", "held-lease", "lease-error", "build",
       fake.tasks.push(...[87, 88].map((id) => ({ id, title: id === 88 ? "URGENT: staging readiness" : "Health tab", description: `feature: work-${id}\nResources: none`, labels: ["feature"], assignees: ["CTO-bot"], bucketId: 16 })));
       await syncNow(harness);
       const spawns = harness.inspection.sdk.callsTo("threads.spawn");
-      expect(spawns).toHaveLength(["dependency-wait", "resource-wait"].includes(scenario) ? 2 : 1);
-      if (["dependency-wait", "resource-wait"].includes(scenario)) {
+      expect(spawns).toHaveLength(cap > 1 && ["dependency-wait", "resource-wait"].includes(scenario) ? 2 : 1);
+      if (cap > 1 && ["dependency-wait", "resource-wait"].includes(scenario)) {
         expect(JSON.stringify(spawns[1])).toContain("staging readiness");
         const overview = await harness.behavior.callRpc("overview", null);
         expect(overview.tasks.find((t) => t.taskId === 87)?.state).toBe("paused");
@@ -1395,4 +1403,117 @@ test("resource wait proof rejects stale, mismatched and malformed queue records"
   expect(isFreshResourceWait(valid,"run1",now)).toBe(true);
   for (const patch of [{runId:"other"},{depsMet:false},{blockedBy:"slot cap"},{blockedBy:"resource emulator invalid"},{blockedBy:"resource ios-simulator"},{resources:[]},{resources:[4]},{seenAt:now-180001},{seenAt:now+1},{seenAt:"999000"},{seenAt:NaN}]) expect(isFreshResourceWait({...valid,...patch},"run1",now)).toBe(false);
   expect(isFreshResourceWait(null,"run1",now)).toBe(false);
+});
+
+function dispatch(harness: Awaited<ReturnType<typeof makeHarness>>['harness'], initiator: 'user'|'agent'|'system'|'mixed' = 'system', threadId = 'th_w1', parentThreadId: string|null = null) {
+  return harness.inspection.registrations.hooks['message.dispatch']!(makeMessageDispatchHookContext({thread:{id:threadId},initiator,parentThreadId}));
+}
+
+test('manual pause persists before cancellation, rejects automatic dispatch, cancels durable runs and survives reload', async()=>{
+ const fake:FakeVikunja={tasks:[{id:88,title:'URGENT: candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}],runs:{th_w1:[{id:'fake-run',status:'running',currentPhase:'Merge'}]}};
+ let {harness,workflowCalls}=await makeHarness(fake,{maxFeatureRuns:1});
+ try {
+  await syncNow(harness);
+  fake.onStopRun=async()=>{
+   expect((await harness.behavior.callRpc('overview',null)).tasks[0]!.state).toBe('paused');
+   expect(await dispatch(harness)).toMatchObject({action:'reject'});
+   await harness.behavior.emitThreadEvent('thread.failed',{thread:makeThreadResponse({id:'th_w1'}),error:'cancel notification'});
+  };
+  expect((await harness.behavior.runCli(['pause','88'])).exitCode).toBe(0);
+  expect(stops(workflowCalls)).toEqual(['fake-run']);
+  expect(harness.inspection.sdk.callsTo('threads.retry')).toHaveLength(0);
+  for(const initiator of ['agent','system','mixed'] as const) expect(await dispatch(harness,initiator)).toMatchObject({action:'reject'});
+  expect(await dispatch(harness,'user')).toMatchObject({action:'proceed'});
+  expect(await dispatch(harness,'agent','child','th_w1')).toMatchObject({action:'reject'});
+  expect(await dispatch(harness,'system','unrelated')).toMatchObject({action:'proceed'});
+  const config=await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({thread:{id:'th_w1'},pluginMetadata:{itemId:'88'}}));
+  expect(config.instructions).toContain('PAUSED');expect(config.instructions).toContain('Do not restart');
+  harness=(await harness.lifecycle.reload(plugin)).harness;
+  expect(await dispatch(harness)).toMatchObject({action:'reject'});
+  await harness.behavior.emitThreadEvent('thread.deleted',{thread:makeThreadResponse({id:'th_w1'})});
+  await syncNow(harness);
+  expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(0);
+  expect((await harness.behavior.callRpc('overview',null)).tasks[0]!.state).toBe('paused');
+ } finally {await harness.lifecycle.dispose();}
+});
+
+for(const failure of ['malformed-envelope','malformed-run','stop-error','still-running','thread-stopping','thread-stop-error']) test(`pause fails closed for ${failure}, reserves serial slot, and can retry`,async()=>{
+ const fake:FakeVikunja={tasks:[{id:88,title:'Candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}],runs:{th_w1:[{id:'fake-run',status:'queued',currentPhase:'Queue'}]}};
+ const {harness}=await makeHarness(fake,{maxFeatureRuns:1,maxConcurrent:1});
+ try {
+  await syncNow(harness);
+  if(failure==='malformed-envelope') fake.activeRunsResponse={oops:[]};
+  if(failure==='malformed-run') fake.activeRunsResponse={runs:[{id:'x',status:'mystery'}]};
+  if(failure==='stop-error') fake.stopRunError=true;
+  if(failure==='still-running') fake.keepRunActive=true;
+  if(failure==='thread-stopping') harness.inspection.sdk.stub('threads.get',async()=>makeThreadResponse({id:'th_w1',status:'stopping'}));
+  if(failure==='thread-stop-error') harness.inspection.sdk.stub('threads.stop',async()=>{throw new Error('machine unreachable');});
+  expect((await harness.behavior.runCli(['pause','88'])).exitCode).not.toBe(0);
+  const row=(await harness.behavior.callRpc('overview',null)).tasks[0]!;
+  expect(row.state).toBe('paused');expect(row.error).toContain('pause incomplete:');
+  expect((await harness.behavior.runCli(['resume','88'])).exitCode).not.toBe(0);
+  fake.tasks.push({id:89,title:'Other',labels:['feature'],assignees:['CTO-bot'],bucketId:16});
+  await syncNow(harness);expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(1);
+  delete fake.activeRunsResponse;fake.stopRunError=false;fake.keepRunActive=false;
+  harness.inspection.sdk.stub('threads.get',async()=>makeThreadResponse({id:'th_w1',status:'idle'}));
+  harness.inspection.sdk.stub('threads.stop',async()=>({ok:true}));
+  expect((await harness.behavior.runCli(['pause','88'])).exitCode).toBe(0);
+  expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===88)?.error).toBeNull();
+ } finally {await harness.lifecycle.dispose();}
+});
+
+test('explicit resume activates before send and rolls back on failed delivery',async()=>{
+ const {harness}=await makeHarness({tasks:[{id:88,title:'Candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]},{maxFeatureRuns:1});
+ try {
+  await syncNow(harness);await harness.behavior.runCli(['pause','88']);
+  harness.inspection.sdk.stub('threads.send',async()=>{expect(await dispatch(harness)).toMatchObject({action:'proceed'});throw new Error('fake send failed');});
+  expect((await harness.behavior.runCli(['resume','88'])).exitCode).not.toBe(0);
+  expect(await dispatch(harness)).toMatchObject({action:'reject'});
+  harness.inspection.sdk.stub('threads.send',async()=>{expect(await dispatch(harness)).toMatchObject({action:'proceed'});return {};});
+  expect((await harness.behavior.runCli(['resume','88'])).exitCode).toBe(0);
+  expect((await harness.behavior.callRpc('overview',null)).tasks[0]!.state).toBe('active');
+ }finally{await harness.lifecycle.dispose();}
+});
+
+test('serial defaults and frozen args agree, checkpoint recovery never requests Build replay',async()=>{
+ const {harness}=await makeHarness({tasks:[{id:88,title:'Candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]},{maxFeatureRuns:1,maxConcurrent:1});
+ try {
+  expect(harness.inspection.registrations.settingsDescriptors.maxFeatureRuns.default).toBe(1);
+  expect(harness.inspection.registrations.settingsDescriptors.maxConcurrent.default).toBe(1);
+  await syncNow(harness);
+  const prompt=(harness.inspection.sdk.callsTo('threads.spawn')[0]![0] as {prompt:string}).prompt;
+  expect(prompt).toContain('"maxParallelRuns":1');expect(prompt).toContain('resumeFinalCandidate:true');expect(prompt).toContain('exact args of the run that timed out');expect(prompt).toContain('candidate-checkpoint-invalid');
+ }finally{await harness.lifecycle.dispose();}
+});
+
+test('late reports cannot erase manual pause or mark paused work done',async()=>{
+ const {harness}=await makeHarness({tasks:[{id:88,title:'Candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]});
+ try {
+  await syncNow(harness);await harness.behavior.runCli(['pause','88']);
+  await report(harness,{stage:'progress',note:'late result'});
+  await report(harness,{stage:'done',workflowStatus:'merged-to-main',note:'late completion'});
+  const row=(await harness.behavior.callRpc('overview',null)).tasks[0]!;
+  expect(row.state).toBe('paused');expect(row.progressNote).toBe('paused by user');
+ }finally{await harness.lifecycle.dispose();}
+});
+
+test('scheduler resume activates before send and rolls back on failure without overriding manual pause',async()=>{
+ const fake:FakeVikunja={tasks:[{id:88,title:'First',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]};
+ const {harness}=await makeHarness(fake,{maxFeatureRuns:1,maxConcurrent:1});
+ try {
+  await syncNow(harness);await harness.behavior.runCli(['pause','88']);
+  fake.tasks.push({id:89,title:'Other',labels:['feature'],assignees:['CTO-bot'],bucketId:16});
+  await syncNow(harness);expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(2);
+  await harness.behavior.runCli(['resume','88']);
+  expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===88)?.state).toBe('paused');
+  await harness.behavior.runCli(['pause','89']);
+  harness.inspection.sdk.stub('threads.send',async()=>{expect(await dispatch(harness)).toMatchObject({action:'proceed'});throw new Error('scheduler send failed');});
+  await syncNow(harness);
+  expect(await dispatch(harness)).toMatchObject({action:'reject'});
+  harness.inspection.sdk.stub('threads.send',async()=>{expect(await dispatch(harness)).toMatchObject({action:'proceed'});return {};});
+  await syncNow(harness);
+  const rows=(await harness.behavior.callRpc('overview',null)).tasks;
+  expect(rows.find(t=>t.taskId===88)?.state).toBe('active');
+  expect(rows.find(t=>t.taskId===89)?.state).toBe('paused');
+ }finally{await harness.lifecycle.dispose();}
 });
