@@ -314,6 +314,7 @@ export default async function plugin(bb: BbPluginApi) {
       const task = await chief.taskForDispatch(context.thread.id, context.parentThreadId);
       const controls = await readSettings();
       if (task && !controls.dispatchEnabled && context.initiator !== "user") return {action:"reject",message:"Chief of Staff dispatch is held for reconciliation. Enable dispatch explicitly after checking task state."};
+      if (task?.state === "closed" && context.initiator !== "user") return {action:"reject",message:`Task #${task.taskId} is closed; automatic dispatch is disabled.`};
       if (task?.state === "paused" && context.initiator !== "user") {
         return {action:"reject",message:`Task #${task.taskId} is paused. Automatic dispatch is disabled; use chief resume explicitly.`};
       }
@@ -510,6 +511,18 @@ export default async function plugin(bb: BbPluginApi) {
           async run() {
             await chief.sweep();
             return { exitCode: 0, stdout: "Sync complete." };
+          },
+        }),
+        "reconcile-completed": cliCommand({
+          summary: "While held, close only an authoritatively completed task with verified idle workers (no execution)",
+          positionals: [{name:"task",description:"Vikunja task id",required:true}],
+          options: {json:{type:"boolean",description:"Emit machine-readable JSON"}},
+          async run(input) {
+            const id = Number(input.positionals.task);
+            if (!Number.isSafeInteger(id) || id <= 0) throw new PluginCliError("Expected a positive task id", {code:"bad_usage"});
+            const task = await chief.reconcileCompletedTask(id);
+            if (!task) throw new PluginCliError("No managed task", {code:"task_not_found"});
+            return reply(input.options.json, {task}, `Task #${id} closed from confirmed source completion; no work dispatched.`);
           },
         }),
         tasks: cliCommand({

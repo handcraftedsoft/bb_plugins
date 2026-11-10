@@ -180,3 +180,10 @@ source tracker, preserve intended task pauses, and verify no other exclusive wor
 Only then explicitly run `bb plugin config chief-of-staff set dispatchEnabled true`. Keep
 `maxConcurrent=1` and `maxFeatureRuns=1` for serial delivery. Setting dispatchEnabled false
 holds future dispatch again; it does not delete task history or reset old workflow arguments.
+
+While dispatch is held, `bb chief reconcile-completed <task-id> --json` closes only
+that task's local bookkeeping after two authoritative source checks confirm done=true
+and the root plus host-verified descendants have idle/error status and no active workflows.
+Unverifiable ownership/status blocks instead of guessing. It never sends a message, stops or
+archives a thread, cancels a workflow, changes leases, runs admission, or edits the tracker.
+Missing/unassigned source tasks do not qualify. Other paused tasks and decisions stay untouched.

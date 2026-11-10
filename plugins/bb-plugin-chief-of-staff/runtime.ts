@@ -1055,6 +1055,7 @@ export class ChiefOfStaff {
     if (task === null) {
       return "This thread is not a Chief of Staff worker; the report was ignored.";
     }
+    if (task.state === "closed") return `Task #${task.taskId} is closed; late worker report ignored.`;
     if (task.state === "paused") return `Task #${task.taskId} is paused; late worker report ignored. Resume explicitly before reporting task execution.`;
     const now = Date.now();
     const trimmed = note?.trim() ?? null;
@@ -1219,6 +1220,47 @@ export class ChiefOfStaff {
       this.bb.log.warn(`confirm task ${taskId}: ${cause instanceof Error ? cause.message : String(cause)}`);
       return null;
     }
+  }
+
+  /** Explicit held-mode bookkeeping only: never cancel, archive, message or admit work. */
+  async reconcileCompletedTask(taskId: number): Promise<TaskRow | null> {
+    const settings = await this.readSettings();
+    if (settings.dispatchEnabled) throw new Error("Hold dispatch before reconciling completed tasks");
+    const row = this.store.getTask(taskId);
+    if (!row) return null;
+    if (row.state === "closed") return row;
+    const epoch = this.store.pauseEpoch(taskId);
+    if (await this.confirmLeftVikunja(taskId, settings.assignee) !== "done") throw new Error("Authoritative source has not confirmed done=true");
+    const threads = new Set(this.store.ownedThreads(taskId));
+    if (row.threadId) threads.add(row.threadId);
+    if (!threads.size && row.launchedAt !== null) throw new Error("Cannot verify the prior driver's ownership");
+    for (const threadId of threads) {
+      if (threads.size > 10000) throw new Error("Descendant enumeration bound exceeded");
+      const thread = await this.bb.sdk.threads.get({threadId});
+      if (thread.id !== threadId || !["idle", "error"].includes(thread.status)) throw new Error(`Thread not verified settled: ${threadId}`);
+      const runs = await this.activeRunsForThread(threadId);
+      if (runs === null || runs.length) throw new Error(`Active workflows not verified absent: ${threadId}`);
+      for (let offset = 0; ; offset += 100) {
+        if (offset >= 10000) throw new Error("Descendant enumeration bound exceeded");
+        const children = await this.bb.sdk.threads.list({parentThreadId:threadId,includeHidden:true,limit:100,offset});
+        if (!Array.isArray(children)) throw new Error("Malformed descendant response");
+        for (const child of children) {
+          if (!child.id || child.parentThreadId !== threadId || child.id === threadId || child.id === row.threadId) throw new Error("Unverified or cyclic descendant ownership");
+          threads.add(child.id);
+        }
+        if (children.length < 100) break;
+      }
+    }
+    if (await this.confirmLeftVikunja(taskId, settings.assignee) !== "done") throw new Error("Source completion changed during reconciliation");
+    if ((await this.readSettings()).dispatchEnabled || this.store.pauseEpoch(taskId) !== epoch) throw new Error("Admission/task state changed during reconciliation");
+    // No awaited calls between final hold check and the local bookkeeping write.
+    const now = Date.now();
+    this.store.invalidateResumes(taskId);
+    this.store.setSchedule(taskId, {blockReason:null});
+    for (const threadId of threads) this.store.rememberThreadOwner(threadId, taskId);
+    const updated = this.store.updateTask(taskId, {state:"closed",closedAt:row.closedAt ?? now,stalled:0,error:null,progressNote:"reconciled completed source task while dispatch held",progressAt:now})!;
+    this.publish();
+    return updated;
   }
 
   /**

@@ -180,7 +180,7 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
         list: async () => [],
         spawn: async () => ({ id: `th_w${++spawnCount}` }),
         send: async () => ({}),
-        get: async () => makeThreadResponse({ status: "idle" }),
+        get: async ({threadId}) => makeThreadResponse({ id:threadId, status: "idle" }),
         retry: async () => ({}),
         stop: async () => ({ ok: true }),
         archive: async () => ({}),
@@ -1614,5 +1614,47 @@ test('missing dispatch setting boots held without admitting even an urgent task'
   await syncNow(harness);
   expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(0);
   expect((await harness.behavior.callRpc('overview',null)).tasks).toEqual([]);
+ }finally{await harness.lifecycle.dispose();}
+});
+
+
+for (const refusal of ['open','missing','lookup-error','active-child','live-workflow','unknown-runs','unknown-descendants','reopened-source','dispatch-enabled','none']) test(`held completed reconciliation is bookkeeping-only: ${refusal}`,async()=>{
+ const fake:FakeVikunja={tasks:[{id:88,title:'Candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16},{id:61,title:'Parked',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]};
+ const {harness,workflowCalls,vikunjaCalls}=await makeHarness(fake);
+ try {
+  await syncNow(harness);await harness.behavior.runCli(['pause','61']);
+  const parked=(await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===61);
+  await harness.behavior.setSettings({dispatchEnabled:false});fake.tasks[0]!.done=true;
+  const counts={send:harness.inspection.sdk.callsTo('threads.send').length,stop:harness.inspection.sdk.callsTo('threads.stop').length,spawn:harness.inspection.sdk.callsTo('threads.spawn').length,archive:harness.inspection.sdk.callsTo('threads.archive').length,workflow:stops(workflowCalls).length};
+  if(refusal==='open') fake.tasks[0]!.done=false;
+  if(refusal==='missing') fake.tasks.shift();
+  if(refusal==='lookup-error') fake.lookupError=true;
+  if(refusal==='live-workflow') fake.runs={th_w1:[{id:'live',status:'running',currentPhase:'Merge'}]};
+  if(refusal==='unknown-runs') fake.activeRunsResponse={bad:true};
+  if(refusal==='unknown-descendants') harness.inspection.sdk.stub('threads.list',async()=>{throw new Error('unavailable');});
+  if(refusal==='active-child') {
+   harness.inspection.sdk.stub('threads.list',async({parentThreadId})=>parentThreadId==='th_w1'?[makeThreadResponse({id:'child',parentThreadId:'th_w1'})]:[]);
+   harness.inspection.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,status:threadId==='child'?'active':'idle'}));
+  }
+  if(refusal==='reopened-source') harness.inspection.sdk.stub('threads.list',async()=>{fake.tasks[0]!.done=false;return [];});
+  if(refusal==='dispatch-enabled') await harness.behavior.setSettings({dispatchEnabled:true});
+  const writesBefore=vikunjaCalls.filter(c=>c.method==='comment'||c.method==='move'||(c.method==='call'&&String((c.input as {name?:string})?.name).includes('update'))).length;
+  const result=await harness.behavior.runCli(['reconcile-completed','88']);
+  expect(result.exitCode).toBe(refusal==='none'?0:1);
+  const rows=(await harness.behavior.callRpc('overview',null)).tasks;
+  expect(rows.find(t=>t.taskId===88)?.state).toBe(refusal==='none'?'closed':'active');
+  expect(rows.find(t=>t.taskId===61)).toEqual(parked);
+  expect(harness.inspection.sdk.callsTo('threads.send')).toHaveLength(counts.send);
+  expect(harness.inspection.sdk.callsTo('threads.stop')).toHaveLength(counts.stop);
+  expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(counts.spawn);
+  expect(harness.inspection.sdk.callsTo('threads.archive')).toHaveLength(counts.archive);
+  expect(stops(workflowCalls)).toHaveLength(counts.workflow);
+  expect(vikunjaCalls.filter(c=>c.method==='comment'||c.method==='move'||(c.method==='call'&&String((c.input as {name?:string})?.name).includes('update')))).toHaveLength(writesBefore);
+  if(refusal==='none') {
+   await harness.behavior.setSettings({dispatchEnabled:true});
+   expect(await dispatch(harness)).toMatchObject({action:'reject'});
+   await report(harness,{stage:'progress',note:'stale late report'});
+   expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===88)?.state).toBe('closed');
+  }
  }finally{await harness.lifecycle.dispose();}
 });
