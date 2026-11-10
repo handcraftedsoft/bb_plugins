@@ -296,3 +296,11 @@ the whole surface with examples.
 
 Confused by the API, or need something the types don't explain? Clone the BB
 repo and read the source: <https://github.com/get-bb/bb>.
+
+## Safe bootstrap hold
+
+Task dispatch is now opt-in: `dispatchEnabled` defaults to false. Loading the plugin does not
+start backlog work until `bb plugin config chief-of-staff set dispatchEnabled true` is explicitly
+set. Inspect status, pause unwanted tasks, and reconcile completed tasks in Vikunja first.
+Keep both concurrency settings at one for serial delivery. The hold blocks future execution,
+not already-running processes; use task pause to cancel and verify those separately.

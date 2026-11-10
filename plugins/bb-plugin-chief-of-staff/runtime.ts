@@ -704,6 +704,7 @@ export class ChiefOfStaff {
   }
 
   private async sendToThread(threadId: string, text: string): Promise<void> {
+    if (!(await this.readSettings()).dispatchEnabled) throw new Error("Chief of Staff dispatch is held for reconciliation");
     await this.bb.sdk.threads.send({
       threadId,
       mode: "auto",
@@ -758,6 +759,7 @@ export class ChiefOfStaff {
   }
 
   private async introduceTask(task: VikunjaTask, settings: CosSettings): Promise<void> {
+    if (!(await this.readSettings()).dispatchEnabled) return;
     const epoch = this.store.pauseEpoch(task.id);
     const now = Date.now();
     // Reuse first: the vikunja plugin's task↔thread links.
@@ -1414,6 +1416,7 @@ export class ChiefOfStaff {
   }
 
   async resumeTask(taskId: number): Promise<TaskRow | null> {
+    if (!(await this.readSettings()).dispatchEnabled) throw new Error("Dispatch is held; reconcile tasks before enabling dispatch and resuming");
     const task = this.store.getTask(taskId);
     if (task === null) return null;
     if (task.state !== "paused") throw new Error(`Task #${taskId} is ${task.state}; only paused tasks can resume`);
@@ -1475,6 +1478,7 @@ export class ChiefOfStaff {
   }
 
   async handleThreadFailed(threadId: string, error: string | null): Promise<void> {
+    if (!(await this.readSettings()).dispatchEnabled) return;
     const task = this.store.taskByThreadId(threadId);
     if (task === null || task.state !== "active" || task.progressNote?.startsWith("blocked: QUESTION:")) return;
     if (task.retries < AUTO_RETRIES) {
@@ -1516,6 +1520,7 @@ export class ChiefOfStaff {
     this.sweeping = true;
     try {
       const settings = await this.readSettings();
+      if (!settings.dispatchEnabled) return;
       const configured = await this.vikunjaConfigured();
       if (!configured) {
         await this.refreshBriefing(false);

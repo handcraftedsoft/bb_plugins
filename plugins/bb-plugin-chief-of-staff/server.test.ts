@@ -111,7 +111,7 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
   const workflowCalls: Array<{ method: string; input: unknown }> = [];
   const { bb, harness } = createFakePluginHost({
     pluginId: "chief-of-staff",
-    settings: { project: "proj_jjitzuscx6", assignee: "CTO-bot", maxFeatureRuns: 3, maxConcurrent: 3, ...settings },
+    settings: { dispatchEnabled: true, project: "proj_jjitzuscx6", assignee: "CTO-bot", maxFeatureRuns: 3, maxConcurrent: 3, ...settings },
     sdk: {
       plugins: {
         callRpc: async (args: { pluginId?: string; method: string; input: unknown }) => {
@@ -1578,5 +1578,41 @@ test('deleted feature driver stays blocked instead of reconstructing stale candi
   // Genuinely new work has a fresh task identity rather than silently resetting #88.
   fake.tasks.push({id:90,title:'Explicit new work',labels:['feature'],assignees:['CTO-bot'],bucketId:16});
   await syncNow(harness);expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(2);
+ }finally{await harness.lifecycle.dispose();}
+});
+
+
+test('bootstrap dispatch hold exposes status and pause but prevents sweep, retries and resume across reload',async()=>{
+ const fake:FakeVikunja={tasks:[{id:88,title:'Stale candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]};
+ let {harness}=await makeHarness(fake);
+ try {
+  expect(harness.inspection.registrations.settingsDescriptors.dispatchEnabled.default).toBe(false);
+  await syncNow(harness);
+  await harness.behavior.setSettings({dispatchEnabled:false});
+  harness=(await harness.lifecycle.reload(plugin)).harness;
+  const initialSpawns=harness.inspection.sdk.callsTo('threads.spawn').length;
+  fake.tasks.push({id:89,title:'New task',labels:['feature'],assignees:['CTO-bot'],bucketId:16});
+  await syncNow(harness);
+  await harness.behavior.emitThreadEvent('thread.failed',{thread:makeThreadResponse({id:'th_w1'}),error:'late failure'});
+  expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(initialSpawns);
+  expect(harness.inspection.sdk.callsTo('threads.retry')).toHaveLength(0);
+  expect(await dispatch(harness)).toMatchObject({action:'reject'});
+  expect(await dispatch(harness,'user')).toMatchObject({action:'proceed'});
+  expect((await harness.behavior.callRpc('overview',null)).tasks.some(t=>t.taskId===88)).toBe(true);
+  expect((await harness.behavior.runCli(['pause','88'])).exitCode).toBe(0);
+  expect((await harness.behavior.runCli(['resume','88'])).exitCode).not.toBe(0);
+  await harness.behavior.setSettings({dispatchEnabled:true});
+  await syncNow(harness);
+  expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(initialSpawns+1);
+  expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===88)?.state).toBe('paused');
+ }finally{await harness.lifecycle.dispose();}
+});
+
+test('missing dispatch setting boots held without admitting even an urgent task',async()=>{
+ const {harness}=await makeHarness({tasks:[{id:88,title:'URGENT stale candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]},{dispatchEnabled:undefined});
+ try {
+  await syncNow(harness);
+  expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(0);
+  expect((await harness.behavior.callRpc('overview',null)).tasks).toEqual([]);
  }finally{await harness.lifecycle.dispose();}
 });

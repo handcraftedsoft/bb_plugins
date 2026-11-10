@@ -139,6 +139,7 @@ export type PolicyView = z.infer<typeof policyViewSchema>;
 export type BriefingView = z.infer<typeof briefingViewSchema>;
 
 const DEFAULTS: CosSettings = {
+  dispatchEnabled: false,
   project: "proj_jjitzuscx6",
   assignee: "CTO-bot",
   maxConcurrent: 1,
@@ -170,7 +171,14 @@ function workerInstructionsFor(title: string, mode: TaskMode): string {
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
 
+  let dispatchEnabled = false;
   const settings = bb.settings.define({
+    dispatchEnabled: {
+      type: "boolean",
+      label: "Enable task dispatch (leave off during reconciliation)",
+      default: false,
+      experimental_schema: z.boolean(),
+    },
     project: {
       type: "string",
       label: "BB project for new worker threads",
@@ -271,7 +279,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function readSettings(): Promise<CosSettings> {
     const values = await settings.get();
+    dispatchEnabled = values.dispatchEnabled === true;
     return {
+      dispatchEnabled,
       project:
         typeof values.project === "string" && values.project !== "" ? values.project : DEFAULTS.project,
       assignee:
@@ -294,6 +304,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  await readSettings(); // Absent or malformed setting never enables execution on load.
   const db = bb.storage.database();
   bb.storage.migrate(db, SCHEMA);
   const store = new ChiefStore(db);
@@ -301,6 +312,8 @@ export default async function plugin(bb: BbPluginApi) {
   bb.experimental_hooks.on("message.dispatch", async (context) => {
     try {
       const task = await chief.taskForDispatch(context.thread.id, context.parentThreadId);
+      const controls = await readSettings();
+      if (task && !controls.dispatchEnabled && context.initiator !== "user") return {action:"reject",message:"Chief of Staff dispatch is held for reconciliation. Enable dispatch explicitly after checking task state."};
       if (task?.state === "paused" && context.initiator !== "user") {
         return {action:"reject",message:`Task #${task.taskId} is paused. Automatic dispatch is disabled; use chief resume explicitly.`};
       }
@@ -383,6 +396,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.configure((context) => {
     const paused = store.ownedTask(context.thread.id) ?? (context.thread.parentThreadId ? store.ownedTask(context.thread.parentThreadId) : null);
+    if (paused && !dispatchEnabled) return {tools:[],skills:[],instructions:"Chief of Staff execution is held for reconciliation. Answer direct user questions only; do not run work, workflows, tests, child agents, or retries until dispatch is explicitly enabled."};
     if (paused?.state === "paused") return {tools:[],skills:[],instructions:`Task #${paused.taskId} is PAUSED. Answer direct user questions only. Do not restart work, workflows, tests, child agents or automatic retries. Ask the user to resume through chief resume before continuing task execution.`};
     const itemId = context.pluginMetadata.itemId;
     if (typeof itemId !== "string" || itemId === "") {

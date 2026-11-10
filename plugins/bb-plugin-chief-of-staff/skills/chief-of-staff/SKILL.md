@@ -166,3 +166,17 @@ current, or replay Spec/Build. Restore the original driver and inspect its actua
 checkpoint before resuming it. If the user explicitly wants genuinely new work, create a new
 Vikunja task with a new identity; do not silently reset the old feature task. Merely changing a
 title or clearing an error is not authorization to replay an old candidate.
+
+### Held bootstrap for safe reconciliation
+
+`dispatchEnabled` defaults to false, including existing installations without the setting.
+Enabling/loading the plugin alone exposes status, pause, decisions and other management tools
+but does not poll/admit tasks, resume drivers, retry failed workers, or dispatch automatic
+messages to owned threads. Direct user questions remain allowed without execution. This hold
+does not retroactively stop already-running processes: use task pause and verify cancellation.
+
+Before turning dispatch on, inspect `bb chief tasks`, reconcile completed work through the
+source tracker, preserve intended task pauses, and verify no other exclusive work reservation.
+Only then explicitly run `bb plugin config chief-of-staff set dispatchEnabled true`. Keep
+`maxConcurrent=1` and `maxFeatureRuns=1` for serial delivery. Setting dispatchEnabled false
+holds future dispatch again; it does not delete task history or reset old workflow arguments.
