@@ -74,6 +74,8 @@ export interface BriefingRow {
 export interface CosSettings {
   /** Fail-closed bootstrap hold: status/pause remain available, execution is opt-in. */
   dispatchEnabled: boolean;
+  /** null permits the serial queue; a task ID restricts execution until explicitly cleared. */
+  allowedTaskId: number | null;
   /** BB project that new worker threads are spawned into. */
   project: string;
   /** Vikunja username whose tasks are managed ("CTO-bot"). */

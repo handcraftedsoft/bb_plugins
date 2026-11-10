@@ -304,3 +304,10 @@ start backlog work until `bb plugin config chief-of-staff set dispatchEnabled tr
 set. Inspect status, pause unwanted tasks, and reconcile completed tasks in Vikunja first.
 Keep both concurrency settings at one for serial delivery. The hold blocks future execution,
 not already-running processes; use task pause to cancel and verify those separately.
+
+
+### Restore only one selected task
+
+`allowedTaskId` is a durable numeric setting: `-1` (the default) holds all task execution, `0` explicitly permits the normal serial queue, and a positive task ID restricts execution to that task and its verified descendants. The SDK cannot represent a nullable numeric setting. Missing or malformed stored values fall back to the fail-closed default; the host may normalize legacy numeric strings to their exact numeric value.
+
+Keep `dispatchEnabled=false` while selecting a task and reconciling completed tasks. After all external acceptance leases are released and the operator approves restoration, enable dispatch and explicitly resume the selected task. Selection does not bypass pauses, closed-task barriers, serial caps, or missing-driver recovery checks. It does not clear when the selected task completes: other tasks remain excluded until the operator explicitly changes the setting. Direct questions/status remain available, without execution tools on excluded tasks. Selection is an admission barrier, not cancellation of already running work; set it while held and quiescent.

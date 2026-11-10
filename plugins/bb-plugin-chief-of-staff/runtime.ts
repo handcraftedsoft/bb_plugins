@@ -531,6 +531,7 @@ export class ChiefOfStaff {
   }
 
   private async spawnWorker(task: VikunjaTask, settings: CosSettings, meta: TaskMeta): Promise<string> {
+    if (!(await this.executionAllowed(task.id))) throw new Error("Task dispatch is held or restricted");
     const base = {
       projectId: settings.project,
       environment: { type: "project-default" } as const,
@@ -555,6 +556,7 @@ export class ChiefOfStaff {
         );
       }
     }
+    if (!(await this.executionAllowed(task.id))) throw new Error("Task dispatch is held or restricted");
     const thread = await this.bb.sdk.threads.spawn(base);
     return thread.id;
   }
@@ -703,8 +705,14 @@ export class ChiefOfStaff {
     }
   }
 
+  private async executionAllowed(taskId: number): Promise<boolean> {
+    const settings = await this.readSettings();
+    return settings.dispatchEnabled && (settings.allowedTaskId === null || settings.allowedTaskId === taskId);
+  }
+
   private async sendToThread(threadId: string, text: string): Promise<void> {
-    if (!(await this.readSettings()).dispatchEnabled) throw new Error("Chief of Staff dispatch is held for reconciliation");
+    const owner = this.store.ownedTask(threadId);
+    if (!owner || !(await this.executionAllowed(owner.taskId))) throw new Error("Chief of Staff dispatch is held or restricted to another task");
     await this.bb.sdk.threads.send({
       threadId,
       mode: "auto",
@@ -727,6 +735,7 @@ export class ChiefOfStaff {
   private async adoptTask(task: VikunjaTask, threadId: string, now: number, settings: CosSettings): Promise<void> {
     const epoch = this.store.pauseEpoch(task.id);
     const meta = await this.metaFor(task, settings);
+    if (!(await this.executionAllowed(task.id))) return;
     // The tools are gated on pluginMetadata.itemId; claim the thread so the
     // next turn constructs its session with chief_of_staff_* available.
     try {
@@ -759,7 +768,7 @@ export class ChiefOfStaff {
   }
 
   private async introduceTask(task: VikunjaTask, settings: CosSettings): Promise<void> {
-    if (!(await this.readSettings()).dispatchEnabled) return;
+    if (!(await this.executionAllowed(task.id))) return;
     const epoch = this.store.pauseEpoch(task.id);
     const now = Date.now();
     // Reuse first: the vikunja plugin's task↔thread links.
@@ -1416,6 +1425,7 @@ export class ChiefOfStaff {
 
   /** A feature driver held back by the scheduler continues once its resources are free. */
   private async resumeIfEligible(taskId: number, threadId: string, settings: CosSettings): Promise<void> {
+    if (!(await this.executionAllowed(taskId))) return;
     const epoch = this.store.pauseEpoch(taskId);
     const decision = await this.scheduleHeld(taskId, settings);
     if (this.store.pauseEpoch(taskId) !== epoch) return;
@@ -1458,7 +1468,7 @@ export class ChiefOfStaff {
   }
 
   async resumeTask(taskId: number): Promise<TaskRow | null> {
-    if (!(await this.readSettings()).dispatchEnabled) throw new Error("Dispatch is held; reconcile tasks before enabling dispatch and resuming");
+    if (!(await this.executionAllowed(taskId))) throw new Error("Dispatch is held or restricted; select this task and enable dispatch before resuming");
     const task = this.store.getTask(taskId);
     if (task === null) return null;
     if (task.state !== "paused") throw new Error(`Task #${taskId} is ${task.state}; only paused tasks can resume`);
@@ -1520,9 +1530,10 @@ export class ChiefOfStaff {
   }
 
   async handleThreadFailed(threadId: string, error: string | null): Promise<void> {
-    if (!(await this.readSettings()).dispatchEnabled) return;
+    const controls = await this.readSettings();
+    if (!controls.dispatchEnabled) return;
     const task = this.store.taskByThreadId(threadId);
-    if (task === null || task.state !== "active" || task.progressNote?.startsWith("blocked: QUESTION:")) return;
+    if (task === null || task.state !== "active" || task.progressNote?.startsWith("blocked: QUESTION:") || (controls.allowedTaskId !== null && controls.allowedTaskId !== task.taskId)) return;
     if (task.retries < AUTO_RETRIES) {
       try {
         await this.bb.sdk.threads.retry({ threadId, reason: "Chief of Staff auto-retry" });
@@ -1612,6 +1623,7 @@ export class ChiefOfStaff {
       };
       const admissionOrder = [...tasks].sort((a, b) => Number(/^URGENT\b/i.test(b.title)) - Number(/^URGENT\b/i.test(a.title)) || Number(finalCandidate(b.id)) - Number(finalCandidate(a.id)));
       for (const task of admissionOrder) {
+        if (!(await this.executionAllowed(task.id))) continue;
         const row = this.store.getTask(task.id);
         // A manual pause survives thread deletion and never becomes scheduler eligibility.
         if (row?.state === "paused" && (row.progressNote === "paused by user" || row.error?.startsWith("pause incomplete:"))) continue;

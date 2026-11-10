@@ -140,6 +140,7 @@ export type BriefingView = z.infer<typeof briefingViewSchema>;
 
 const DEFAULTS: CosSettings = {
   dispatchEnabled: false,
+  allowedTaskId: -1,
   project: "proj_jjitzuscx6",
   assignee: "CTO-bot",
   maxConcurrent: 1,
@@ -172,7 +173,14 @@ export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
 
   let dispatchEnabled = false;
+  let allowedTaskId: number | null = null;
   const settings = bb.settings.define({
+    allowedTaskId: {
+      type: "number",
+      label: "Only dispatch task ID (-1 = hold all, 0 = unrestricted queue)",
+      default: -1,
+      experimental_schema: z.number().int().min(-1).max(Number.MAX_SAFE_INTEGER),
+    },
     dispatchEnabled: {
       type: "boolean",
       label: "Enable task dispatch (leave off during reconciliation)",
@@ -277,11 +285,21 @@ export default async function plugin(bb: BbPluginApi) {
     return trimmed === "" && !allowEmpty ? fallback : trimmed;
   }
 
+  function updateDispatchControls(values: {dispatchEnabled?: unknown; allowedTaskId?: unknown}): void {
+    // The SDK normalizes malformed/absent stored values to -1. Only explicit zero opens the queue.
+    const selection = values.allowedTaskId;
+    const validSelection = typeof selection === "number" && Number.isSafeInteger(selection) && selection >= 0;
+    allowedTaskId = validSelection && selection === 0 ? null : validSelection ? selection as number : -1;
+    dispatchEnabled = values.dispatchEnabled === true && validSelection;
+  }
+  settings.onChange(updateDispatchControls);
+
   async function readSettings(): Promise<CosSettings> {
     const values = await settings.get();
-    dispatchEnabled = values.dispatchEnabled === true;
+    updateDispatchControls(values);
     return {
       dispatchEnabled,
+      allowedTaskId,
       project:
         typeof values.project === "string" && values.project !== "" ? values.project : DEFAULTS.project,
       assignee:
@@ -313,6 +331,7 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       const task = await chief.taskForDispatch(context.thread.id, context.parentThreadId);
       const controls = await readSettings();
+      if (task && controls.allowedTaskId !== null && task.taskId !== controls.allowedTaskId && context.initiator !== "user") return {action:"reject",message:"This task is outside the operator-selected dispatch restriction."};
       if (task && !controls.dispatchEnabled && context.initiator !== "user") return {action:"reject",message:"Chief of Staff dispatch is held for reconciliation. Enable dispatch explicitly after checking task state."};
       if (task?.state === "closed" && context.initiator !== "user") return {action:"reject",message:`Task #${task.taskId} is closed; automatic dispatch is disabled.`};
       if (task?.state === "paused" && context.initiator !== "user") {
@@ -397,6 +416,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.configure((context) => {
     const paused = store.ownedTask(context.thread.id) ?? (context.thread.parentThreadId ? store.ownedTask(context.thread.parentThreadId) : null);
+    if (paused && allowedTaskId !== null && paused.taskId !== allowedTaskId) return {tools:[],skills:[],instructions:"This task is outside the operator-selected dispatch restriction. Answer direct user questions only; do not execute work."};
     if (paused && !dispatchEnabled) return {tools:[],skills:[],instructions:"Chief of Staff execution is held for reconciliation. Answer direct user questions only; do not run work, workflows, tests, child agents, or retries until dispatch is explicitly enabled."};
     if (paused?.state === "paused") return {tools:[],skills:[],instructions:`Task #${paused.taskId} is PAUSED. Answer direct user questions only. Do not restart work, workflows, tests, child agents or automatic retries. Ask the user to resume through chief resume before continuing task execution.`};
     const itemId = context.pluginMetadata.itemId;

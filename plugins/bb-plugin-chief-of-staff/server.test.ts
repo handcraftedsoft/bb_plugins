@@ -111,7 +111,7 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
   const workflowCalls: Array<{ method: string; input: unknown }> = [];
   const { bb, harness } = createFakePluginHost({
     pluginId: "chief-of-staff",
-    settings: { dispatchEnabled: true, project: "proj_jjitzuscx6", assignee: "CTO-bot", maxFeatureRuns: 3, maxConcurrent: 3, ...settings },
+    settings: { dispatchEnabled: true, allowedTaskId: 0, project: "proj_jjitzuscx6", assignee: "CTO-bot", maxFeatureRuns: 3, maxConcurrent: 3, ...settings },
     sdk: {
       plugins: {
         callRpc: async (args: { pluginId?: string; method: string; input: unknown }) => {
@@ -1657,4 +1657,66 @@ for (const refusal of ['open','missing','lookup-error','active-child','live-work
    expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===88)?.state).toBe('closed');
   }
  }finally{await harness.lifecycle.dispose();}
+});
+
+
+test('selected task restriction survives reload, excludes urgent admission and descendants, and remains after completion',async()=>{
+ const fake:FakeVikunja={tasks:[{id:86,title:'Selected',labels:['feature'],assignees:['CTO-bot'],bucketId:16},{id:61,title:'Other',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]};
+ let {harness}=await makeHarness(fake);
+ try {
+  await syncNow(harness);
+  await harness.behavior.runCli(['pause','86']);
+  await harness.behavior.runCli(['pause','61']);
+  await harness.behavior.setSettings({dispatchEnabled:false,allowedTaskId:86,maxFeatureRuns:1,maxConcurrent:1});
+  harness=(await harness.lifecycle.reload(plugin)).harness;
+  const other=(await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===61);
+  const sends=harness.inspection.sdk.callsTo('threads.send').length;
+  const spawns=harness.inspection.sdk.callsTo('threads.spawn').length;
+  fake.tasks.push({id:99,title:'URGENT competitor',labels:['feature'],assignees:['CTO-bot'],bucketId:16});
+  expect((await harness.behavior.runCli(['resume','86'])).exitCode).toBe(1);
+  await syncNow(harness);
+  expect(harness.inspection.sdk.callsTo('threads.send')).toHaveLength(sends);
+  await harness.behavior.setSettings({dispatchEnabled:true});
+  await syncNow(harness);
+  expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(spawns);
+  expect((await harness.behavior.runCli(['resume','61'])).exitCode).toBe(1);
+  expect((await harness.behavior.runCli(['resume','86'])).exitCode).toBe(0);
+  expect(harness.inspection.sdk.callsTo('threads.send')).toHaveLength(sends+1);
+  expect(await dispatch(harness,'system','selected-child','th_w1')).toMatchObject({action:'proceed'});
+  expect(await dispatch(harness,'system','other-child','th_w2')).toMatchObject({action:'reject'});
+  expect(await dispatch(harness,'user','other-child','th_w2')).toMatchObject({action:'proceed'});
+  expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===61)).toEqual(other);
+  await harness.behavior.setSettings({dispatchEnabled:false});fake.tasks[0]!.done=true;
+  expect((await harness.behavior.runCli(['reconcile-completed','86'])).exitCode).toBe(0);
+  await harness.behavior.setSettings({dispatchEnabled:true});await syncNow(harness);
+  expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(spawns);
+  expect(await dispatch(harness,'system','selected-child','th_w1')).toMatchObject({action:'reject'});
+  expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===86)?.state).toBe('closed');
+ }finally{await harness.lifecycle.dispose();}
+});
+
+test('selected resume still respects the occupied serial slot and a setting change before send',async()=>{
+ const fake:FakeVikunja={tasks:[{id:86,title:'Selected',labels:['feature'],assignees:['CTO-bot'],bucketId:16},{id:61,title:'Other',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]};
+ const {harness}=await makeHarness(fake);
+ try{
+  await syncNow(harness);await harness.behavior.runCli(['pause','86']);
+  await harness.behavior.setSettings({allowedTaskId:86,maxFeatureRuns:1,maxConcurrent:1});
+  const sends=harness.inspection.sdk.callsTo('threads.send').length;
+  expect(await dispatch(harness,'system','active-other-child','th_w2')).toMatchObject({action:'reject'});
+  await harness.behavior.emitThreadEvent('thread.failed',{thread:makeThreadResponse({id:'th_w2'}),error:'late failure'});
+  expect(harness.inspection.sdk.callsTo('threads.retry')).toHaveLength(0);
+  await harness.behavior.runCli(['resume','86']);
+  expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===86)?.state).toBe('paused');
+  expect(harness.inspection.sdk.callsTo('threads.send')).toHaveLength(sends);
+  await harness.behavior.runCli(['pause','61']);
+  harness.inspection.sdk.stub('threads.get',async({threadId})=>{await harness.behavior.setSettings({allowedTaskId:61});return makeThreadResponse({id:threadId,status:'idle'});});
+  expect((await harness.behavior.runCli(['resume','86'])).exitCode).toBe(1);
+  expect(harness.inspection.sdk.callsTo('threads.send')).toHaveLength(sends);
+  expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===86)?.state).toBe('paused');
+ }finally{await harness.lifecycle.dispose();}
+});
+
+for(const allowedTaskId of ['broken','',NaN,Infinity,-1,-2,1.5,null,undefined]) test(`malformed task restriction fails closed: ${JSON.stringify(allowedTaskId)}`,async()=>{
+ const {harness}=await makeHarness({tasks:[{id:86,title:'Selected',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]},{allowedTaskId});
+ try{await syncNow(harness);expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(0);}finally{await harness.lifecycle.dispose();}
 });

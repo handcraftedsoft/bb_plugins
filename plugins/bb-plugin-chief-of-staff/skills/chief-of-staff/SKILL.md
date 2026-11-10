@@ -187,3 +187,10 @@ and the root plus host-verified descendants have idle/error status and no active
 Unverifiable ownership/status blocks instead of guessing. It never sends a message, stops or
 archives a thread, cancels a workflow, changes leases, runs admission, or edits the tracker.
 Missing/unassigned source tasks do not qualify. Other paused tasks and decisions stay untouched.
+
+
+### Restore only one selected task
+
+`allowedTaskId` is a durable numeric setting: `-1` (the default) holds all task execution, `0` explicitly permits the normal serial queue, and a positive task ID restricts execution to that task and its verified descendants. The SDK cannot represent a nullable numeric setting. Missing or malformed stored values fall back to the fail-closed default; the host may normalize legacy numeric strings to their exact numeric value.
+
+Keep `dispatchEnabled=false` while selecting a task and reconciling completed tasks. After all external acceptance leases are released and the operator approves restoration, enable dispatch and explicitly resume the selected task. Selection does not bypass pauses, closed-task barriers, serial caps, or missing-driver recovery checks. It does not clear when the selected task completes: other tasks remain excluded until the operator explicitly changes the setting. Direct questions/status remain available, without execution tools on excluded tasks. Selection is an admission barrier, not cancellation of already running work; set it while held and quiescent.
