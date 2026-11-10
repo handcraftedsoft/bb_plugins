@@ -97,6 +97,8 @@ export const SCHEMA: string[] = [
      decision_id TEXT PRIMARY KEY,
      kind TEXT NOT NULL DEFAULT 'routine'
    )`,
+  `CREATE TABLE IF NOT EXISTS cos_thread_owners (thread_id TEXT PRIMARY KEY, task_id INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS cos_pause_epochs (task_id INTEGER PRIMARY KEY, epoch INTEGER NOT NULL)`,
 ];
 
 const BRIEFINGS_KEPT = 20;
@@ -453,6 +455,31 @@ export class ChiefStore {
       .prepare<[string], TaskRecord>("SELECT * FROM cos_tasks WHERE thread_id = ? ORDER BY updated_at DESC")
       .get(threadId);
     return record === undefined ? null : toTaskRow(record);
+  }
+
+  rememberThreadOwner(threadId: string, taskId: number): void {
+    const old = this.ownedTask(threadId);
+    if (old && old.taskId !== taskId) throw new Error("conflicting persisted thread ownership");
+    this.db.prepare("INSERT OR IGNORE INTO cos_thread_owners VALUES (?, ?)").run(threadId, taskId);
+  }
+
+  ownedTask(threadId: string): TaskRow | null {
+    const direct = this.taskByThreadId(threadId);
+    if (direct) return direct;
+    const row = this.db.prepare<[string], {task_id:number}>("SELECT task_id FROM cos_thread_owners WHERE thread_id = ?").get(threadId);
+    return row ? this.getTask(row.task_id) : null;
+  }
+
+  ownedThreads(taskId: number): string[] {
+    return this.db.prepare<[number], {thread_id:string}>("SELECT thread_id FROM cos_thread_owners WHERE task_id = ?").all(taskId).map(r => r.thread_id);
+  }
+
+  pauseEpoch(taskId: number): number {
+    return this.db.prepare<[number], {epoch:number}>("SELECT epoch FROM cos_pause_epochs WHERE task_id = ?").get(taskId)?.epoch ?? 0;
+  }
+
+  invalidateResumes(taskId: number): void {
+    this.db.prepare("INSERT INTO cos_pause_epochs VALUES (?, 1) ON CONFLICT(task_id) DO UPDATE SET epoch = epoch + 1").run(taskId);
   }
 
   listTasks(): TaskRow[] {

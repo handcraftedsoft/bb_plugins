@@ -146,3 +146,23 @@ Operating constraints:
   sentence.
 
 Codex cost savings (A–E + A+ + A++): on `nextAction=continue-repair` / partial with `repairIssues` / **main-merge conflict** (`mergeConflict` / `mergeConflictRepair`) / **manager adoption** of process or lane-ownership MAJORs on the integration branch, re-run with `continueRepair:true` + same `specRound` (and mergeConflict fields when present) — no fresh Spec. Fresh Spec only on first attempt, true scope change, or new ticket; never solely for a merge conflict or solely because the manager patched process MAJORs; "manager fixes + ONE FRESH run" means continue-repair, not a new Codex Spec; cap `MAX_SPEC_ROUNDS=3` then pause. Mechanical/identity tickets skip early/final Codex review inside the workflow.
+
+
+### Durable pause and legacy recovery limitations
+
+Pause persists before cancellation and invalidates pending admissions. It verifies the worker,
+all host-verified descendants (including hidden grandchildren), and their active workflows.
+An enumeration or stop failure remains `pause incomplete` and reserves admission even if the
+root thread was deleted. Retry pause only after the ownership/stop problem is resolved.
+Automatic dispatch with unavailable or cyclic ancestry is rejected; ownership comes from host
+thread relationships, never titles, task text, or untrusted plugin metadata. Verified ownership
+survives reload and root deletion. No live settings or existing tasks are migrated by installing
+this source change.
+
+Historical task metadata does not contain the exact last workflow arguments or a durable
+recovery envelope. If a feature driver is lost, resume therefore leaves the task paused and
+blocked: it must not reconstruct arguments from task text, assume a stale Merge status is
+current, or replay Spec/Build. Restore the original driver and inspect its actual run result and
+checkpoint before resuming it. If the user explicitly wants genuinely new work, create a new
+Vikunja task with a new identity; do not silently reset the old feature task. Merely changing a
+title or clearing an error is not authorization to replay an old candidate.

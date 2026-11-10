@@ -403,7 +403,7 @@ export class ChiefOfStaff {
     // A failed pause is not proof that its workflow stopped: retain its admission slot.
     for (const row of this.store.listTasksWithState("paused")) {
       const meta = this.store.getTaskMeta(row.taskId);
-      if (row.threadId && meta?.mode === "feature" && row.error?.startsWith("pause incomplete:")) {
+      if (meta?.mode === "feature" && row.error?.startsWith("pause incomplete:")) {
         active.push({ taskId: row.taskId, feature: meta.feature, resources: this.store.getSchedule(row.taskId).deps?.resources ?? [] });
       }
     }
@@ -724,6 +724,7 @@ export class ChiefOfStaff {
 
   /** Adopts a task that already has a linked thread (reuse, never respawn). */
   private async adoptTask(task: VikunjaTask, threadId: string, now: number, settings: CosSettings): Promise<void> {
+    const epoch = this.store.pauseEpoch(task.id);
     const meta = await this.metaFor(task, settings);
     // The tools are gated on pluginMetadata.itemId; claim the thread so the
     // next turn constructs its session with chief_of_staff_* available.
@@ -734,6 +735,7 @@ export class ChiefOfStaff {
         `claim thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`,
       );
     }
+    if (this.store.pauseEpoch(task.id) !== epoch) return;
     this.store.upsertTask(
       { taskId: task.id, title: task.title, projectId: task.projectId, lastTaskUpdated: task.updated },
       now,
@@ -756,6 +758,7 @@ export class ChiefOfStaff {
   }
 
   private async introduceTask(task: VikunjaTask, settings: CosSettings): Promise<void> {
+    const epoch = this.store.pauseEpoch(task.id);
     const now = Date.now();
     // Reuse first: the vikunja plugin's task↔thread links.
     let links: string[] = [];
@@ -770,10 +773,12 @@ export class ChiefOfStaff {
     // (an adopted driver would otherwise relaunch its run beside a conflicting one).
     const meta = await this.metaFor(task, settings);
     const scheduled = meta.mode === "feature" ? await this.scheduleFeature(task, meta, settings) : null;
+    if (this.store.pauseEpoch(task.id) !== epoch) return;
     if (scheduled === null || scheduled.decision.eligible) {
       for (const candidate of [...links].reverse()) {
         const alive = await this.threadAlive(candidate);
         if (alive === null || alive.archivedAt !== null) continue;
+        if (this.store.pauseEpoch(task.id) !== epoch) return;
         await this.adoptTask(task, candidate, now, settings);
         if (scheduled !== null) this.store.setSchedule(task.id, { deps: scheduled.deps, blockReason: null });
         await this.moveTaskToDoing(task);
@@ -803,6 +808,7 @@ export class ChiefOfStaff {
       }
     }
     const productive = await this.productiveFeatureRuns(settings);
+    if (this.store.pauseEpoch(task.id) !== epoch) return;
     const waitingFeatures = this.store.activeFeatureRuns().length - productive.length;
     const active = this.store.listTasksWithState("active").length - waitingFeatures;
     if (active >= settings.maxConcurrent) {
@@ -816,7 +822,13 @@ export class ChiefOfStaff {
     let threadId: string;
     try {
       threadId = await this.spawnWorker(task, settings, meta);
+      if (this.store.pauseEpoch(task.id) !== epoch) {
+        this.store.rememberThreadOwner(threadId, task.id);
+        await this.pauseTask(task.id);
+        return;
+      }
     } catch (cause) {
+      if (this.store.pauseEpoch(task.id) !== epoch) throw cause;
       const message = cause instanceof Error ? cause.message : String(cause);
       this.store.upsertTask(
         { taskId: task.id, title: task.title, projectId: task.projectId, lastTaskUpdated: task.updated },
@@ -1276,27 +1288,78 @@ export class ChiefOfStaff {
     }
   }
 
+  /** Resolve host-verified ancestry, retaining ownership after driver deletion/reload. */
+  async taskForDispatch(threadId: string, parentThreadId: string | null): Promise<TaskRow | null> {
+    const chain = [threadId];
+    let current: string | null = threadId;
+    const seen = new Set<string>();
+    while (current !== null) {
+      if (seen.has(current) || seen.size >= 100) throw new Error("unverifiable thread ancestry");
+      seen.add(current);
+      const task = this.store.ownedTask(current);
+      if (task) {
+        for (const id of chain) this.store.rememberThreadOwner(id, task.taskId);
+        return this.store.getTask(task.taskId);
+      }
+      if (current === threadId) current = parentThreadId;
+      else {
+        const parent = await this.bb.sdk.threads.get({threadId:current});
+        if (parent.id !== current) throw new Error("mismatched ancestry response");
+        current = parent.parentThreadId;
+      }
+      if (current) chain.push(current);
+    }
+    return null;
+  }
+
+  private blockLostFeatureDriver(taskId: number): TaskRow {
+    const stopUnconfirmed = this.store.getTask(taskId)?.state === "active";
+    this.store.invalidateResumes(taskId);
+    this.store.setSchedule(taskId, {blockReason:null});
+    return this.store.updateTask(taskId, {state:"paused", progressNote:"paused by user", error:(stopUnconfirmed ? "pause incomplete: " : "") + "Recovery blocked: feature driver unavailable; exact prior workflow args are not persisted. Restore the driver and inspect its result/checkpoint. For genuinely new work, create a new task explicitly; never replay Spec/Build from stale metadata."})!;
+  }
+
   async pauseTask(taskId: number): Promise<TaskRow | null> {
     const task = this.store.getTask(taskId);
     if (task === null) return null;
     if (task.state !== "active" && task.state !== "paused") throw new Error(`Task #${taskId} is ${task.state}; only active or paused tasks can pause`);
+    this.store.invalidateResumes(taskId);
     // Persist FIRST: cancellation emits terminal notifications that can otherwise restart the driver.
     this.store.updateTask(taskId, {state:"paused",stalled:0,error:"pause incomplete: stopping worker and workflows",progressNote:"paused by user",progressAt:Date.now()});
     this.store.setSchedule(taskId, {blockReason:null});
     const errors: string[] = [];
-    if (task.threadId !== null) {
-      const runs = await this.activeRunsForThread(task.threadId);
-      if (runs === null) errors.push("cannot verify active workflows");
+    const owned = new Set(this.store.ownedThreads(taskId));
+    if (task.threadId !== null) owned.add(task.threadId);
+    // Enumerate every descendant before confirming stop, including hidden children.
+    try {
+      for (const threadId of owned) {
+        this.store.rememberThreadOwner(threadId, taskId);
+        for (let offset = 0; ; offset += 100) {
+          if (offset >= 10000 || owned.size > 10000) throw new Error("descendant enumeration bound exceeded");
+          const children = await this.bb.sdk.threads.list({parentThreadId:threadId,includeHidden:true,limit:100,offset});
+          if (!Array.isArray(children)) throw new Error("malformed descendant response");
+          for (const child of children) {
+            if (!child.id || child.parentThreadId !== threadId) throw new Error("unverified descendant ownership");
+            this.store.rememberThreadOwner(child.id, taskId);
+            owned.add(child.id);
+          }
+          if (children.length < 100) break;
+        }
+      }
+    } catch (cause) { errors.push(`descendants: ${cause instanceof Error ? cause.message : String(cause)}`); }
+    for (const threadId of [...owned].reverse()) {
+      const runs = await this.activeRunsForThread(threadId);
+      if (runs === null) errors.push(`cannot verify active workflows for ${threadId}`);
       else for (const run of runs) {
-        try { await this.workflowsRpc("workflowStopRun", {threadId:task.threadId,runId:run.id}); }
+        try { await this.workflowsRpc("workflowStopRun", {threadId,runId:run.id}); }
         catch (cause) { errors.push(`stop ${run.id}: ${cause instanceof Error ? cause.message : String(cause)}`); }
       }
       try {
-        await this.bb.sdk.threads.stop({threadId:task.threadId});
-        const thread = await this.bb.sdk.threads.get({threadId:task.threadId});
+        await this.bb.sdk.threads.stop({threadId});
+        const thread = await this.bb.sdk.threads.get({threadId});
         if (thread.status !== "idle" && thread.status !== "error") errors.push(`worker stop unconfirmed (${thread.status})`);
       } catch (cause) { errors.push(`worker stop: ${cause instanceof Error ? cause.message : String(cause)}`); }
-      const remaining = await this.activeRunsForThread(task.threadId);
+      const remaining = await this.activeRunsForThread(threadId);
       if (remaining === null) errors.push("cannot verify cancellation");
       else if (remaining.length) errors.push(`workflows still active: ${remaining.map(r=>r.id).join(", ")}`);
     }
@@ -1309,7 +1372,9 @@ export class ChiefOfStaff {
 
   /** A feature driver held back by the scheduler continues once its resources are free. */
   private async resumeIfEligible(taskId: number, threadId: string, settings: CosSettings): Promise<void> {
+    const epoch = this.store.pauseEpoch(taskId);
     const decision = await this.scheduleHeld(taskId, settings);
+    if (this.store.pauseEpoch(taskId) !== epoch) return;
     if (!decision.eligible) {
       if (this.store.getSchedule(taskId).blockReason !== decision.reason) {
         this.store.setSchedule(taskId, { blockReason: decision.reason });
@@ -1318,11 +1383,13 @@ export class ChiefOfStaff {
       return;
     }
     const alive = await this.threadAlive(threadId);
+    if (this.store.pauseEpoch(taskId) !== epoch) return;
     if (alive === null || alive.archivedAt !== null) {
       this.store.updateTask(taskId, { threadId: null, state: "paused", error: "worker thread is gone" });
       return;
     }
     const prior = this.store.getTask(taskId)!;
+    if (!prior.error?.startsWith(SCHEDULER_HOLD)) return;
     const priorReason = this.store.getSchedule(taskId).blockReason;
     this.store.setSchedule(taskId, { blockReason: null });
     this.store.updateTask(taskId, {
@@ -1339,6 +1406,7 @@ export class ChiefOfStaff {
         "The resources this task needs are free now (the Chief of Staff held it back while a conflicting run used the device). Continue now: check your workflow run with `bb workflows status`; if it is not running, read its result and follow its nextAction (resume-final-candidate uses the exact last args plus resumeFinalCandidate:true, never Build replay). Only then launch ONE permitted fresh run, and report 'progress' with its run id.",
       );
     } catch (cause) {
+      if (this.store.pauseEpoch(taskId) !== epoch) throw cause;
       this.store.updateTask(taskId, prior);
       this.store.setSchedule(taskId, {blockReason:priorReason});
       throw cause;
@@ -1349,13 +1417,16 @@ export class ChiefOfStaff {
     const task = this.store.getTask(taskId);
     if (task === null) return null;
     if (task.state !== "paused") throw new Error(`Task #${taskId} is ${task.state}; only paused tasks can resume`);
+    const epoch = this.store.pauseEpoch(taskId);
     const priorReason = this.store.getSchedule(taskId).blockReason;
     if (task.error?.startsWith("pause incomplete:")) throw new Error(`Task #${taskId} stop is unconfirmed; retry pause before resuming`);
-    if (task.threadId !== null && (await this.threadAlive(task.threadId)) !== null) {
+    const resumeThread = task.threadId === null ? null : await this.threadAlive(task.threadId);
+    if (task.threadId !== null && resumeThread !== null && resumeThread.archivedAt === null) {
       if (this.store.getTaskMeta(taskId)?.mode === "feature") {
         // Never resume a feature driver beside a run holding its (or a conflicting) resource.
         await this.recordLeaseResources();
         const decision = await this.scheduleHeld(taskId, await this.readSettings());
+        if (this.store.pauseEpoch(taskId) !== epoch) return this.store.getTask(taskId);
         if (!decision.eligible) {
           const updated = this.store.updateTask(taskId, { error: SCHEDULER_HOLD + decision.reason!, progressNote: "resume requested; waiting for admission" })!;
           this.store.setSchedule(taskId, { blockReason: decision.reason });
@@ -1365,6 +1436,7 @@ export class ChiefOfStaff {
         }
         this.store.setSchedule(taskId, { blockReason: null });
       }
+      if (this.store.pauseEpoch(taskId) !== epoch) return this.store.getTask(taskId);
       const updated = this.store.updateTask(taskId, {
         state: "active",
         progressNote: "resumed",
@@ -1379,6 +1451,7 @@ export class ChiefOfStaff {
           "The user resumed this task. Continue working on it now, starting with a chief_of_staff_report stage 'progress' note on where you left off.",
         );
       } catch (cause) {
+        if (this.store.pauseEpoch(taskId) !== epoch) throw cause;
         this.store.updateTask(taskId, task);
         this.store.setSchedule(taskId, {blockReason:priorReason});
         throw cause;
@@ -1387,7 +1460,9 @@ export class ChiefOfStaff {
       this.publish();
       return updated;
     }
-    // No usable thread: clear it and let the next sweep reintroduce the task.
+    if (this.store.pauseEpoch(taskId) !== epoch) return this.store.getTask(taskId);
+    if (this.store.getTaskMeta(taskId)?.mode === "feature") return this.blockLostFeatureDriver(taskId);
+    // Plain tasks without workflow history may be reintroduced explicitly.
     const updated = this.store.updateTask(taskId, { threadId: null, state: "active", progressNote: "resumed", error: null })!;
     await this.sweep();
     return this.store.getTask(taskId) ?? updated;
@@ -1421,7 +1496,10 @@ export class ChiefOfStaff {
   handleThreadGone(threadId: string, why: "archived" | "deleted"): void {
     const task = this.store.taskByThreadId(threadId);
     if (task === null) return;
-    if (task.state === "active") {
+    this.store.rememberThreadOwner(threadId, task.taskId);
+    if (task.state === "active" && this.store.getTaskMeta(task.taskId)?.mode === "feature") {
+      this.blockLostFeatureDriver(task.taskId);
+    } else if (task.state === "active") {
       this.store.updateTask(task.taskId, { threadId: null, error: `worker thread ${why}` });
     } else if (task.state === "paused" && !task.error?.startsWith("pause incomplete:")) {
       this.store.updateTask(task.taskId, { threadId: null });
@@ -1490,6 +1568,7 @@ export class ChiefOfStaff {
         const row = this.store.getTask(task.id);
         // A manual pause survives thread deletion and never becomes scheduler eligibility.
         if (row?.state === "paused" && (row.progressNote === "paused by user" || row.error?.startsWith("pause incomplete:"))) continue;
+        if (row?.threadId === null && row.launchedAt !== null && this.store.getTaskMeta(task.id)?.mode === "feature") { this.blockLostFeatureDriver(task.id); continue; }
         if (row === null || row.threadId === null) {
           await this.introduceTask(task, settings);
           continue;
@@ -1514,6 +1593,7 @@ export class ChiefOfStaff {
 
         const alive = await this.threadAlive(row.threadId);
         if (alive === null || alive.archivedAt !== null) {
+          if (this.store.getTaskMeta(task.id)?.mode === "feature") { this.blockLostFeatureDriver(task.id); continue; }
           this.store.updateTask(task.id, { threadId: null, error: "worker thread is gone" });
           await this.introduceTask(task, settings);
           continue;

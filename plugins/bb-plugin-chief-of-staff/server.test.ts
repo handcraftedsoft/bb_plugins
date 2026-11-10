@@ -177,6 +177,7 @@ async function makeHarness(fake: FakeVikunja, settings: Record<string, unknown> 
         },
       },
       threads: {
+        list: async () => [],
         spawn: async () => ({ id: `th_w${++spawnCount}` }),
         send: async () => ({}),
         get: async () => makeThreadResponse({ status: "idle" }),
@@ -1437,11 +1438,12 @@ test('manual pause persists before cancellation, rejects automatic dispatch, can
  } finally {await harness.lifecycle.dispose();}
 });
 
-for(const failure of ['malformed-envelope','malformed-run','stop-error','still-running','thread-stopping','thread-stop-error']) test(`pause fails closed for ${failure}, reserves serial slot, and can retry`,async()=>{
+for(const failure of ['malformed-envelope','malformed-run','stop-error','still-running','thread-stopping','thread-stop-error','descendants-error']) test(`pause fails closed for ${failure}, reserves serial slot, and can retry`,async()=>{
  const fake:FakeVikunja={tasks:[{id:88,title:'Candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}],runs:{th_w1:[{id:'fake-run',status:'queued',currentPhase:'Queue'}]}};
  const {harness}=await makeHarness(fake,{maxFeatureRuns:1,maxConcurrent:1});
  try {
   await syncNow(harness);
+  if(failure==='descendants-error') harness.inspection.sdk.stub('threads.list',async()=>{throw new Error('unavailable ancestry');});
   if(failure==='malformed-envelope') fake.activeRunsResponse={oops:[]};
   if(failure==='malformed-run') fake.activeRunsResponse={runs:[{id:'x',status:'mystery'}]};
   if(failure==='stop-error') fake.stopRunError=true;
@@ -1455,6 +1457,7 @@ for(const failure of ['malformed-envelope','malformed-run','stop-error','still-r
   fake.tasks.push({id:89,title:'Other',labels:['feature'],assignees:['CTO-bot'],bucketId:16});
   await syncNow(harness);expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(1);
   delete fake.activeRunsResponse;fake.stopRunError=false;fake.keepRunActive=false;
+  harness.inspection.sdk.stub('threads.list',async()=>[]);
   harness.inspection.sdk.stub('threads.get',async()=>makeThreadResponse({id:'th_w1',status:'idle'}));
   harness.inspection.sdk.stub('threads.stop',async()=>({ok:true}));
   expect((await harness.behavior.runCli(['pause','88'])).exitCode).toBe(0);
@@ -1515,5 +1518,65 @@ test('scheduler resume activates before send and rolls back on failure without o
   const rows=(await harness.behavior.callRpc('overview',null)).tasks;
   expect(rows.find(t=>t.taskId===88)?.state).toBe('active');
   expect(rows.find(t=>t.taskId===89)?.state).toBe('paused');
+ }finally{await harness.lifecycle.dispose();}
+});
+
+test('pause covers verified grandchildren, persists ownership after deletion, and refuses unknown ancestry', async () => {
+ const fake:FakeVikunja={tasks:[{id:88,title:'Candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}],runs:{grand:[{id:'nested-run',status:'running',currentPhase:'Build'}]}};
+ const {harness,workflowCalls}=await makeHarness(fake);
+ try {
+  await syncNow(harness);
+  harness.inspection.sdk.stub('threads.list',async({parentThreadId})=>parentThreadId==='th_w1'?[makeThreadResponse({id:'child',parentThreadId:'th_w1'})]:parentThreadId==='child'?[makeThreadResponse({id:'grand',parentThreadId:'child'})]:[]);
+  harness.inspection.sdk.stub('threads.get',async({threadId})=>makeThreadResponse({id:threadId,status:'idle',parentThreadId:threadId==='grand'?'child':threadId==='child'?'th_w1':null}));
+  expect((await harness.behavior.runCli(['pause','88'])).exitCode).toBe(0);
+  expect(stops(workflowCalls)).toContain('nested-run');
+  expect(harness.inspection.sdk.callsTo('threads.stop').map(c=>c[0].threadId)).toEqual(['grand','child','th_w1']);
+  await harness.behavior.emitThreadEvent('thread.deleted',{thread:makeThreadResponse({id:'th_w1'})});
+  expect(await dispatch(harness,'system','grand','child')).toMatchObject({action:'reject'});
+  const config=await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({thread:{id:'grand',parentThreadId:'child'}}));
+  expect(config.instructions).toContain('PAUSED');
+  harness.inspection.sdk.stub('threads.get',async()=>{throw new Error('missing ancestor');});
+  expect(await dispatch(harness,'agent','new-grand','unknown-parent')).toMatchObject({action:'reject'});
+ } finally {await harness.lifecycle.dispose();}
+});
+
+test('manual pause invalidates an in-flight scheduler resume and failed-send rollback',async()=>{
+ const fake:FakeVikunja={tasks:[{id:88,title:'First',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]};
+ const {harness}=await makeHarness(fake,{maxFeatureRuns:1,maxConcurrent:1});
+ try {
+  await syncNow(harness);await harness.behavior.runCli(['pause','88']);
+  fake.tasks.push({id:89,title:'Other',labels:['feature'],assignees:['CTO-bot'],bucketId:16});
+  await syncNow(harness);await harness.behavior.runCli(['resume','88']);await harness.behavior.runCli(['pause','89']);
+  let pauseOnce=true;
+  harness.inspection.sdk.stub('threads.get',async({threadId})=>{
+   if(threadId==='th_w1'&&pauseOnce){pauseOnce=false;await harness.behavior.runCli(['pause','88']);}
+   return makeThreadResponse({id:threadId,status:'idle'});
+  });
+  const sends=harness.inspection.sdk.callsTo('threads.send').length;
+  await syncNow(harness);
+  expect(harness.inspection.sdk.callsTo('threads.send')).toHaveLength(sends);
+  expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===88)?.progressNote).toBe('paused by user');
+  // A newer pause during a send must also survive the older resume's rollback.
+  harness.inspection.sdk.stub('threads.send',async()=>{await harness.behavior.runCli(['pause','88']);throw new Error('late delivery failure');});
+  await harness.behavior.runCli(['resume','88']);
+  expect((await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===88)?.progressNote).toBe('paused by user');
+ } finally {await harness.lifecycle.dispose();}
+});
+
+test('deleted feature driver stays blocked instead of reconstructing stale candidate args',async()=>{
+ const fake:FakeVikunja={tasks:[{id:88,title:'Candidate',labels:['feature'],assignees:['CTO-bot'],bucketId:16}]};
+ const {harness}=await makeHarness(fake);
+ try {
+  await syncNow(harness);
+  await report(harness,{stage:'progress',workflowStatus:'queue-timeout',workflowRunId:'old-run',note:'Merge pending'});
+  await harness.behavior.runCli(['pause','88']);
+  await harness.behavior.emitThreadEvent('thread.deleted',{thread:makeThreadResponse({id:'th_w1'})});
+  await harness.behavior.runCli(['resume','88']);await syncNow(harness);
+  const row=(await harness.behavior.callRpc('overview',null)).tasks.find(t=>t.taskId===88)!;
+  expect(row.state).toBe('paused');expect(row.error).toContain('exact prior workflow args are not persisted');
+  expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(1);
+  // Genuinely new work has a fresh task identity rather than silently resetting #88.
+  fake.tasks.push({id:90,title:'Explicit new work',labels:['feature'],assignees:['CTO-bot'],bucketId:16});
+  await syncNow(harness);expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(2);
  }finally{await harness.lifecycle.dispose();}
 });

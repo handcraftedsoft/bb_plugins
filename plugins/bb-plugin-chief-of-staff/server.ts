@@ -298,13 +298,14 @@ export default async function plugin(bb: BbPluginApi) {
   bb.storage.migrate(db, SCHEMA);
   const store = new ChiefStore(db);
   const chief = new ChiefOfStaff(bb, store, readSettings);
-  // Synchronous persisted lookup: even cancellation notifications and retry drains see the pause.
-  // Only verified origin/direct-parent mappings are covered; never guess from titles or metadata.
-  bb.experimental_hooks.on("message.dispatch", (context) => {
-    const task = store.taskByThreadId(context.thread.id) ??
-      (context.parentThreadId ? store.taskByThreadId(context.parentThreadId) : null);
-    if (task?.state === "paused" && context.initiator !== "user") {
-      return {action:"reject",message:`Task #${task.taskId} is paused. Automatic dispatch is disabled; use chief resume explicitly.`};
+  bb.experimental_hooks.on("message.dispatch", async (context) => {
+    try {
+      const task = await chief.taskForDispatch(context.thread.id, context.parentThreadId);
+      if (task?.state === "paused" && context.initiator !== "user") {
+        return {action:"reject",message:`Task #${task.taskId} is paused. Automatic dispatch is disabled; use chief resume explicitly.`};
+      }
+    } catch {
+      return {action:"reject",message:"Thread ownership could not be verified. Dispatch held until ancestry is available."};
     }
     return {action:"proceed"};
   });
@@ -381,8 +382,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.configure((context) => {
-    const paused = store.taskByThreadId(context.thread.id) ??
-      (context.thread.parentThreadId ? store.taskByThreadId(context.thread.parentThreadId) : null);
+    const paused = store.ownedTask(context.thread.id) ?? (context.thread.parentThreadId ? store.ownedTask(context.thread.parentThreadId) : null);
     if (paused?.state === "paused") return {tools:[],skills:[],instructions:`Task #${paused.taskId} is PAUSED. Answer direct user questions only. Do not restart work, workflows, tests, child agents or automatic retries. Ask the user to resume through chief resume before continuing task execution.`};
     const itemId = context.pluginMetadata.itemId;
     if (typeof itemId !== "string" || itemId === "") {
