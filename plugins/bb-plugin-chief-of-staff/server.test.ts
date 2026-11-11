@@ -563,7 +563,7 @@ test("plain tasks spawn an implementer on GLM-5.3 and a 'feature:' line also rou
     await syncNow(harness);
     const spawns = harness.inspection.sdk.callsTo("threads.spawn").map((call) => call[0] as Record<string, unknown>);
     expect(spawns[0]!.model).toBe("account:zai-individual-coding-plan/GLM-5.3");
-    expect(String(spawns[0]!.prompt)).toContain("merge your branch into local main");
+    expect(String(spawns[0]!.prompt)).toContain("merge --ff-only <verified-sha>");
     expect(String(spawns[1]!.prompt)).toContain('"feature":"landing-hero"');
   } finally {
     await harness.lifecycle.dispose();
@@ -678,7 +678,7 @@ test("push alone is standing policy; deploy still needs the task to ask", async 
   const { harness } = await makeHarness({
     tasks: [
       { id: 29, title: "Update landing copy and deploy to production", assignees: ["CTO-bot"], bucketId: 16 },
-      { id: 30, title: "Update landing copy", assignees: ["CTO-bot"], bucketId: 16 },
+      { id: 30, title: "Update landing copy and push to origin", description: "Push: yes\npublishRequested: true", assignees: ["CTO-bot"], bucketId: 16 },
     ],
   });
   try {
@@ -694,7 +694,10 @@ test("push alone is standing policy; deploy still needs the task to ask", async 
       { question: "Tests are green and main is merged. Should I push to origin now?" },
       { threadId: "th_w2" },
     );
-    expect(allowedPush).toMatch(/standing policy|push/i);
+    expect(allowedPush).toContain("Git push standing policy");
+    expect(allowedPush).toContain("unless the task explicitly says no-push or local-only");
+    expect(allowedPush).toContain("only the Git push, not deployment or release");
+    expect(allowedPush).not.toContain("deploy requested by the task");
     const pending = harness.behavior.callAgentTool(
       "chief_of_staff_ask",
       { question: "Tests are green and main is merged. Should I push and deploy now?" },
@@ -720,7 +723,15 @@ test("built-in policies no longer forbid merging to main and tell plain tasks ho
     const overview = await harness.behavior.callRpc("overview", null);
     const answers = overview.policies.filter((policy) => policy.source === "builtin").map((policy) => policy.answer);
     expect(answers.some((answer) => answer.includes("Never commit directly to the default branch"))).toBe(false);
-    expect(answers.some((answer) => answer.includes("LOCAL main is reversible"))).toBe(true);
+    const merge = answers.find((answer) => answer.includes("LOCAL main is reversible"));
+    expect(merge).toContain("merge --ff-only <verified-sha>");
+    expect(merge).toContain("push origin <verified-sha>:refs/heads/main");
+    expect(merge).toContain("unless the task explicitly says no-push or local-only");
+    expect(merge).not.toContain("merge --no-ff");
+    const testing = answers.find((answer) => answer.includes("rateyourfood-test-budget"));
+    expect(testing).toContain("Reuse meaningful existing coverage");
+    expect(testing).toContain("concrete uncovered failure");
+    expect(testing).not.toContain("Add or update tests for any behavior");
   } finally {
     await harness.lifecycle.dispose();
   }

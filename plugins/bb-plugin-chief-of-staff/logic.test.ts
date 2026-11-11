@@ -24,6 +24,20 @@ const NO = [
   "Deploy = false",
   "Size: normal\nfeature: x\nDeploy: no\nThen deploy to prod.", // explicit line wins
   "Deploy: yes\nDeploy: no", // any explicit no wins
+  "Deploy: yes\nNo deployment.",
+  "Deploy: yes\nno-deploy",
+  "Deploy: yes\nDo not deploy.", // prose veto also beats an explicit yes
+  "Ship: yes\nDo not release to production.",
+  "Push: yes",
+  "publishRequested: true",
+  "Then push to origin when green",
+  "Push main to remote",
+  "Please push to GitHub",
+  "Push to origin/main",
+  "Push to production",
+  "Please publish the verified branch",
+  "Publish: yes",
+  "Deploy: no\nPush: yes\nPlease deploy to staging",
   "Do not deploy.",
   "don't deploy the VPS",
   "No deploy needed",
@@ -45,10 +59,11 @@ const NO = [
 const YES = [
   "Deploy: yes",
   "Ship: yes",
+  "Release: yes",
+  "Delivery: yes",
   "deploy = true",
   "Hero and redeploy prod after completion",
   "Update landing copy and deploy to production",
-  "Then push to origin when green",
   "Please deploy.",
   "Deploy to staging after merge",
   "Ship it",
@@ -102,8 +117,8 @@ test("classifyTask: explicit feature line (markdown-tolerant) wins over the titl
 test("question routing: push notifications / release builds are not deploy questions", () => {
   expect(classifyQuestion("Should I add push notifications via FCM?", false)).toBe("routine");
   expect(classifyQuestion("Should the release build use R8?", false)).toBe("routine");
-  expect(classifyQuestion("Should I push to origin now?", false)).toBe("deploy-allowed");
-  expect(classifyQuestion("Should I push to origin now?", true)).toBe("deploy-allowed");
+  expect(classifyQuestion("Should I push to origin now?", false)).toBe("push-allowed");
+  expect(classifyQuestion("Should I push to origin now?", true)).toBe("push-allowed");
   expect(classifyQuestion("Can I deploy to prod?", false)).toBe("irreversible");
   expect(classifyQuestion("Can I deploy to prod?", true)).toBe("deploy-allowed");
   expect(classifyQuestion("Tests are green. Should I push and deploy now?", false)).toBe("irreversible");
@@ -308,6 +323,10 @@ test("buildWorkerPrompt: continue-repair / spec-rounds-exhausted / no fresh Spec
   expect(prompt).toMatch(/manager adoption/);
   expect(prompt).toMatch(/ONE FRESH run.*continueRepair/s);
   expect(prompt).toMatch(/Manager adoption exception/);
+  expect(prompt).toContain("retryPublication:true and publicationCommit:<exact result SHA>");
+  expect(prompt).toContain("checks the remote outcome before retrying and runs no Spec, Build, review, checks, merge, or deploy");
+  expect(prompt).toContain('Status "publication-complete" / nextAction "deploy" means publication succeeded but deployment is still pending');
+  expect(prompt.indexOf('status "publication-failed"')).toBeLessThan(prompt.indexOf("anything else (partial"));
   expect(operatingRules({ mode: "feature", feature: "backend-scaffold", deployRequested: false, workflowName: "feature-delivery" }).join("\n")).toMatch(/continueRepair:true/);
 });
 
@@ -316,11 +335,17 @@ test("question instructions consistently use the nonblocking handoff and retain 
   for (const mode of ["task", "feature"] as const) {
     const prompt = buildWorkerPrompt({ id: 83, title: "Documentation", description: "" }, { mode, feature: "docs", deployRequested: false, workflowName: "feature-delivery" });
     expect(prompt).toContain(QUESTION_HANDOFF);
+    expect(prompt).toContain("unless the task explicitly says no-push or local-only");
+    expect(prompt).toContain("Git publication is not deployment authorization");
     expect(workerInstructions("Documentation", mode)).toContain(QUESTION_HANDOFF);
     expect(prompt.replace(QUESTION_HANDOFF, "")).not.toContain("chief_of_staff_ask");
   }
   expect(featureDoneAllowed("nothing-to-build", false)).toBe(false);
   expect(featureDoneAllowed("lane-less-blocked", false)).toBe(false);
+  for (const status of ["publication-failed", "publication-held", "publication-complete"]) {
+    expect(featureDoneAllowed(status, false)).toBe(false);
+    expect(featureDoneAllowed(status, true)).toBe(false);
+  }
   expect(featureDoneAllowed("merged-to-main", false)).toBe(true);
   expect(featureDoneAllowed("merged-to-main", true)).toBe(false);
 });

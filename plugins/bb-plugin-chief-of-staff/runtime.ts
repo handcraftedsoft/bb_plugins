@@ -20,7 +20,6 @@ import {
   type BoardColumn,
   CHANGED_CHANNEL,
   classifyQuestion,
-  triageQuestion,
   classifyDependencies,
   classifyTask,
   describeAnswer,
@@ -895,11 +894,11 @@ export class ChiefOfStaff {
     const deployRequested = meta?.deployRequested ?? false;
     const triage = classifyQuestion(`${question}\n${input.context ?? ""}`, deployRequested, input.kind);
 
-    if (triage === "deploy-allowed") {
-      const detail = triageQuestion(`${question}\n${input.context ?? ""}`, deployRequested, input.kind);
-      const answer = detail.reason.includes("standing policy")
-        ? "Push after a green merge is standing policy: once everything is merged to local main and tests pass, `git push origin main` (never force) and report what you pushed. Do not deploy unless the task asked for a deploy/release. Anything else irreversible still needs Denis."
-        : "This task explicitly asks for the deploy/release, so it is allowed: after a green merge to local main and all tests pass, `git push origin main` (never force; standing policy), then use the documented deploy procedure for the affected area only, and report what you did. Anything else irreversible still needs Denis.";
+    if (triage === "push-allowed" || triage === "deploy-allowed") {
+      const pushOnly = triage === "push-allowed";
+      const answer = pushOnly
+        ? "Git push is standing policy unless the task explicitly says no-push or local-only; if it does, do not push. Otherwise publish only the exact final-candidate SHA whose required gates passed, using `git push origin <verified-sha>:refs/heads/main` (never force), verify the remote ref equals that SHA, and report it. This answer authorizes only the Git push, not deployment or release. Anything else irreversible still needs Denis."
+        : "This task explicitly asks for the deploy/release, so it is allowed: after the required gates pass on the exact final candidate, publish that SHA to origin/main (never force), unless the task explicitly says no-push or local-only. Verify the remote SHA before using the documented deploy procedure for the affected area only, and report what you did. Conflicting publication restrictions stay blocked. Anything else irreversible still needs Denis.";
       this.store.insertDecision({
         itemId: String(task.taskId),
         threadId,
@@ -913,7 +912,7 @@ export class ChiefOfStaff {
       });
       this.briefSoon();
       this.publish();
-      return `ANSWER (chief of staff: deploy requested by the task): ${answer}`;
+      return `ANSWER (chief of staff: ${pushOnly ? "Git push standing policy" : "deploy requested by the task"}): ${answer}`;
     }
 
     const kind: DecisionKind = triage === "irreversible" ? "irreversible" : "routine";
@@ -1457,7 +1456,7 @@ export class ChiefOfStaff {
     try {
       await this.sendToThread(
         threadId,
-        "The resources this task needs are free now (the Chief of Staff held it back while a conflicting run used the device). Continue now: check your workflow run with `bb workflows status`; if it is not running, read its result and follow its nextAction (resume-final-candidate uses the exact last args plus resumeFinalCandidate:true, never Build replay). Only then launch ONE permitted fresh run, and report 'progress' with its run id.",
+        "The resources this task needs are free now (the Chief of Staff held it back while a conflicting run used the device). Continue now: check your workflow run with `bb workflows status`; if it is not running, read its result and follow its nextAction (resume-final-candidate uses exact last args plus resumeFinalCandidate:true; retry-publication uses exact last args plus retryPublication:true and publicationCommit from the result, at most one publication-only retry for transient/uncertain transport after the publisher checks the remote; credential/divergence/hold/checkpoint failures stay blocked; never Build replay or fresh Spec for publication). Only then launch ONE permitted fresh run, and report 'progress' with its run id.",
       );
     } catch (cause) {
       if (this.store.pauseEpoch(taskId) !== epoch) throw cause;

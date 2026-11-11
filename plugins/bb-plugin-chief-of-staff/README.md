@@ -39,15 +39,39 @@ worker thread:
   Moves are logged (and failures warned), never silent. Dispatch leaves a
   comment, a `done` report a final comment; failures are commented too.
 - **Deploy intent (conservative).** `deployRequested` is NO unless the task
-  explicitly asks: an explicit line `Deploy: yes|no` / `Ship: yes|no`
-  (also `Push:`, `Release:`, `Delivery:`; any explicit *no* wins) beats
-  everything; negations (`do not deploy`, `no deploy`, `without pushing`,
-  `skip the release`, …) mean NO; bare mentions (`deploy script`, `deploy
-  docs`, `push notifications`, `release build`, `was deployed`) don't count;
-  only clear affirmatives (`and deploy to prod`, `push to origin`, `redeploy
-  prod`, `ship it`, an imperative `Deploy the …`) mean YES deploy. Ambiguous → NO.
-  Separately: after a green merge to local main, **always** `git push origin main`
-  (never force) — standing policy Oct 2026; that push no longer needs deploy intent.
+  explicitly requests deployment/release: `Deploy: yes`, `Ship: yes`,
+  `Release: yes`, `Delivery: yes`, or a clear affirmative such as `and deploy
+  to prod`, `redeploy prod`, `ship it`, or `release to the Play Store`.
+  An explicit no or a negated deployment/release always vetoes an affirmative,
+  including `Deploy: yes` followed by `Do not deploy`, `No deployment`, or
+  `no-deploy`. Bare mentions (`deploy script`, `deploy docs`, `release build`)
+  do not authorize deployment. `Push: yes`, `publishRequested: true`, generic
+  `publish`, and pushes to origin/main/remote/GitHub are Git publication only.
+  Publish the exact verified candidate SHA by default (never force), unless
+  the task explicitly says no-push or local-only; verify the remote ref equals
+  that SHA. Publishing never grants deployment permission.
+- **Plain-task publication.** Commit a final candidate containing current local
+  main in the worker's own worktree, confirm the worktree is clean, record its
+  immutable SHA, and run the required gates on that SHA. Only fast-forward main with `merge --ff-only`
+  when main has not moved and no locally modified file would be touched. Never
+  create a new merge commit after verification. Unless explicitly no-push or
+  local-only, push `<verified-sha>:refs/heads/main` and confirm the remote SHA.
+  Candidate/main changes require preparation and verification again; rejection
+  stays blocked. Feature workers leave this process to the workflow.
+- **Publication recovery.** `publication-failed` / `retry-publication` preserves
+  the verified candidate. Park actionable credential, divergence, hold, dirty-tree
+  or invalid-receipt/context failures. For transient/uncertain transport only,
+  allow one admitted fresh run with the exact failed-run args plus
+  `retryPublication:true` and its `publicationCommit`. The publisher checks the
+  remote outcome first; it does not rerun Spec, Build, review, checks, merge, or
+  deployment. Do not use cached resume or reconstruct receipts. A second failure
+  remains blocked. `publication-held` is parked; `publication-complete` with
+  `nextAction=deploy` still has pending deployment and is not done.
+- **Meaningful tests.** Reuse existing coverage and extend the nearest case only
+  for a concrete uncovered failure. Choose the cheapest valid layer; no quotas,
+  coverage-percentage goals, or tests proving only mocks. In rateyourfood use
+  `rateyourfood-test-budget`, focused checks during edits, and the unchanged
+  required acceptance gates on the final candidate.
 - **Feature names.** An explicit `feature: <kebab-name>` line (markdown
   `**feature:** \`name\`` and HTML `<p>` tolerated) is used verbatim.
   Otherwise the name is a deterministic slug of the title: parenthesized /
@@ -88,7 +112,7 @@ worker thread:
   line) are driven through the rateyourfood `feature-delivery` workflow by a
   cheap driver worker (ZCode GLM-5.3-Flash) with frozen args; `done` only after `merged-to-main` (or
   `delivered` when the task asked for a deploy). Plain tasks get a GLM-5.3
-  implementer that merges its branch into local main when tests pass.
+  implementer that verifies the final candidate and fast-forwards local main.
 - **Parallel feature runs with dependency layers.** On pickup each feature
   task is classified (`classifyDependencies` in `logic.ts`, mirroring the
   workflow's `classifyDeps`) into three layers, shown in `bb chief tasks`, the
@@ -117,8 +141,8 @@ worker thread:
   merge into main) is the second line of defence.
 - **Reversible work proceeds, irreversible work waits.** Irreversible or
   high-impact questions bypass the policies, never time out, and a dismissal
-  means no. Plain `git push origin` after a green merge is standing policy (always
-  allowed). Deploy/release to production/staging/stores is allowed only when the
+  means no. Git publication of the exact verified candidate is standing policy unless
+  the task explicitly says no-push or local-only. Deploy/release to production/staging/stores is allowed only when the
   task explicitly asked for it.
   Question triage (`triageQuestion` in `logic.ts`) is negation- and
   context-aware:
@@ -147,7 +171,8 @@ worker thread:
     ("purchase flow", "billing page", "paying users") are routine.
   - Changing production config/env vars/feature flags escalates even when
     the task asked for a deploy; so do force-push, DNS and cert changes.
-  - Plain push-to-origin questions are auto-allowed (standing policy). 
+  - Plain push-to-origin questions get a Git-only policy answer, conditional on
+    exact-candidate verification and no task-specific no-push/local-only veto.
     Deploy/release/production/store mentions follow the deploy rules
     (negation-aware; allowed only when the task asked for a deploy); reading
     production ("check the prod logs") is routine.

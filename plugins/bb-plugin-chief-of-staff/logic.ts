@@ -112,7 +112,7 @@ export interface TaskMeta {
   mode: TaskMode;
   /** kebab-case feature name for the workflow (feature mode only). */
   feature: string | null;
-  /** The task text explicitly asks for a push / deploy / release. */
+  /** The task text explicitly asks for a deployment or release, not just a Git push. */
   deployRequested: boolean;
   workflowRunId: string | null;
   workflowStatus: string | null;
@@ -128,6 +128,8 @@ export interface TaskMeta {
  * panel listens and refetches. Lives here (bb-free) so app.tsx can import it. */
 export const CHANGED_CHANNEL = "chief-of-staff-changed";
 
+const PLAIN_TASK_MERGE_RULE = "Plain tasks: prepare and commit the final candidate in your own worktree with the latest local main included. Confirm the worktree is clean and record its immutable <verified-sha>; run the required make test-<app> gates and make lint on that exact SHA. Fast-forward local main with `git -C <main checkout> merge --ff-only <verified-sha>` only when the checkout is on main, main has not moved since preparation, and no locally modified file is touched; otherwise report blocked. Never create a merge commit after verification. Unless the task explicitly says no-push or local-only, push `git -C <main checkout> push origin <verified-sha>:refs/heads/main` (never force), then use `git ls-remote origin refs/heads/main` to verify the remote equals <verified-sha>. If the candidate or main changes, reprepare and reverify; a rejected push stays blocked.";
+
 export const BUILTIN_POLICIES: Array<Pick<PolicyRow, "keywords" | "answer">> = [
   {
     keywords: ["branch", "branches", "worktree", "worktrees"],
@@ -137,12 +139,12 @@ export const BUILTIN_POLICIES: Array<Pick<PolicyRow, "keywords" | "answer">> = [
   {
     keywords: ["merge", "merging", "merged"],
     answer:
-      "Merging into LOCAL main is reversible and expected once everything passes. Feature tasks: feature-delivery does the merge and then always pushes origin main. Plain tasks: once make test-<app> and make lint are green, merge with `git -C <main checkout> merge --no-ff <your branch>` where <main checkout> is the first entry of `git worktree list --porcelain` and must be on main; only if the merge touches no locally modified file there, otherwise report blocked; then `git -C <main checkout> push origin main` (never force). Never force-push or rewrite history.",
+      "Merging into LOCAL main is reversible and expected once everything passes. Feature tasks: feature-delivery owns final-candidate verification, merge, and publication of the exact verified SHA, unless the task explicitly says no-push or local-only. " + PLAIN_TASK_MERGE_RULE + " Never force-push or rewrite history.",
   },
   {
     keywords: ["test", "tests", "testing", "lint"],
     answer:
-      "Run make test-<app> for every area you touched plus make lint; both must be green before you report done. Add or update tests for any behavior you change.",
+      "Reuse meaningful existing coverage and extend the nearest case only for a concrete uncovered failure. Use the cheapest valid test layer; do not add tests for quotas, coverage percentages, or assertions that only prove mocks. Follow the rateyourfood-test-budget skill in rateyourfood. Iterate with focused checks, then run the required make test-<app> gates for touched areas plus make lint on the final candidate before reporting done.",
   },
   {
     keywords: ["commit", "commits"],
@@ -299,28 +301,26 @@ const FEATURE_LINE = /^[\s>*_`#-]*feature[*_`]*\s*[:=][\s*_`]*([a-z0-9][a-z0-9-]
 // ---- deploy intent ------------------------------------------------------------
 // Rules (mirrored in the rateyourfood feature-delivery workflow's
 // `// <deploy-intent>` block; keep the two in sync):
-//   1. An explicit `Deploy: yes|no` / `Ship: yes|no` line wins. Any explicit
-//      "no" beats an explicit "yes" (conflict = ambiguous = NO).
-//   2. A negated mention ("no deploy", "don't deploy", "do not deploy",
-//      "without deploying", "not deploy", "nothing ships", "no push") = NO.
-//   3. Otherwise YES only for an explicit affirmative: "and deploy",
-//      "please deploy", "deploy to prod/staging", "redeploy prod", "ship it",
-//      "push to origin", or an imperative line starting with "Deploy ...".
-//   4. Everything else, including bare mentions ("deploy script",
-//      "deployment docs", "push notifications"), is NO.
-const DEPLOY_VERB = String.raw`(?:re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?|ship(?:s|ped|ping)?|push(?:es|ed|ing)?|releas(?:e|es|ed|ing)|publish(?:es|ed|ing)?)`;
+//   1. An explicit Deploy/Ship/Release/Delivery: no or a negated deployment
+//      mention vetoes any affirmative (conflict = ambiguous = NO).
+//   2. Otherwise an explicit Deploy/Ship/Release/Delivery: yes or a clear
+//      deployment/release request means YES.
+//   3. Git publication is separate: Push: yes, publishRequested: true,
+//      "push to origin", and generic "publish" never authorize deployment.
+//      Bare mentions ("deploy script", "deployment docs") are also NO.
+const DEPLOY_VERB = String.raw`(?:re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?|ship(?:s|ped|ping)?|releas(?:e|es|ed|ing))`;
 const DEPLOY_EXPLICIT =
-  /^[\s>*_`#-]*(?:deploy(?:ment)?|ship|push|release|deliver(?:y)?)(?:\s+requested)?[*_`]*\s*[:=]\s*[*_`]*\s*(yes|y|true|on|required|no|n|false|off|none|never|not)\b/gim;
+  /^[\s>*_`#-]*(?:deploy(?:ment)?|ship|release|deliver(?:y)?)(?:\s+requested)?[*_`]*\s*[:=]\s*[*_`]*\s*(yes|y|true|on|required|no|n|false|off|none|never|not)\b/gim;
 /** Negation cues shared by the deploy rules and question triage. */
 const NEGATION_CUE = String.raw`(?:no|not|never|without|nothing|don'?t|do\s+not|doesn'?t|does\s+not|shouldn'?t|should\s+not|must\s+not|mustn'?t|won'?t|will\s+not|avoid|skip)`;
 const DEPLOY_NEGATED = new RegExp(
-  String.raw`\b${NEGATION_CUE}\b(?:\s+[\w'/-]+){0,3}?\s+${DEPLOY_VERB}\b`,
+  String.raw`\b${NEGATION_CUE}\b(?:\s+[\w'/-]+){0,3}?[\s-]+(?:${DEPLOY_VERB}|deployments?)\b`,
   "i",
 );
 const DEPLOY_AFFIRMATIVE: RegExp[] = [
-  /\b(?:and|then|please|also|afterwards?)\s+(?:re-?deploy|deploy|ship|push|release|publish)\b(?!\s+(?:script|docs?|notes?|notifications?)\b)/i,
+  /\b(?:and|then|please|also|afterwards?)\s+(?:re-?deploy|deploy|ship|release)\b(?!\s+(?:script|docs?|notes?|notifications?)\b)/i,
   new RegExp(
-    String.raw`\b${DEPLOY_VERB}\s+(?:it\s+|this\s+|them\s+|main\s+|the\s+[\w-]+\s+)?(?:to|on|in)\s+(?:the\s+)?(?:prod(?:uction)?|staging|origin|remote|github|upstream|live|server|vps|app\s+store|play\s+store|testflight)\b`,
+    String.raw`\b${DEPLOY_VERB}\s+(?:it\s+|this\s+|them\s+|main\s+|the\s+[\w-]+\s+)?(?:to|on|in)\s+(?:the\s+)?(?:prod(?:uction)?|staging|live|server|vps|app\s+store|play\s+store|testflight)\b`,
     "i",
   ),
   /\b(?:re-?deploy|deploy)\s+(?:the\s+)?(?:prod(?:uction)?|staging|live)\b/i,
@@ -333,18 +333,19 @@ export interface DeployIntent {
   reason: string;
 }
 
-/** Whether the task text explicitly asks for a deploy/push/release. Ambiguous = NO. */
+/** Whether the task explicitly requests deployment/release. Git publication is separate. */
 export function deployIntent(text: string): DeployIntent {
   const source = String(text ?? "");
   const explicit = [...source.matchAll(DEPLOY_EXPLICIT)].map((match) => match[1]!.toLowerCase());
-  if (explicit.length > 0) {
-    const yes = explicit.some((value) => ["yes", "y", "true", "on", "required"].includes(value));
-    const no = explicit.some((value) => !["yes", "y", "true", "on", "required"].includes(value));
-    if (no) return { requested: false, reason: "explicit Deploy/Ship: no line" };
-    if (yes) return { requested: true, reason: "explicit Deploy/Ship: yes line" };
+  const affirmative = ["yes", "y", "true", "on", "required"];
+  if (explicit.some((value) => !affirmative.includes(value))) {
+    return { requested: false, reason: "explicit deployment/release: no line" };
   }
   const plain = source.replace(/[*_`]/g, "").replace(/[’‘]/g, "'");
   if (DEPLOY_NEGATED.test(plain)) return { requested: false, reason: "negated deploy mention" };
+  if (explicit.some((value) => affirmative.includes(value))) {
+    return { requested: true, reason: "explicit deployment/release: yes line" };
+  }
   if (DEPLOY_AFFIRMATIVE.some((pattern) => pattern.test(plain))) return { requested: true, reason: "explicit deploy request" };
   return { requested: false, reason: "no explicit deploy request" };
 }
@@ -429,8 +430,8 @@ export function classifyTask(
 //     time/effort and code nouns ("purchase flow", "billing page") are routine.
 //   * Production config: changing prod config/env vars/feature flags escalates
 //     even when the task asked for a deploy.
-//   * Plain git push to origin (after a green merge): always allowed — standing
-//     policy (Denis, Oct 2026). Deploy/release/production/stores: allowed only
+//   * Plain git push of the verified candidate: standing policy unless the task
+//     explicitly says no-push/local-only (Denis, Oct 2026). Deploy/release/production/stores: allowed only
 //     when the task asked for a deploy (same verbs as deployIntent); negated
 //     mentions do not count.
 
@@ -542,14 +543,14 @@ function infraVerdict(clause: string, dns: boolean): "irreversible" | "routine" 
 
 const PROD_WORD = /\b(?:prod(?:uction)?)\b/i;
 const PROD_CONFIG = /(?:\bconfig\w*|\bsettings?\b|\benv(?:ironment)?\s+var\w*|\.env\b|\bfeature\s+flags?|\bflags?\b|\bvariables?\b)/i;
-/** Push / deploy / production topics: allowed only when the task asked for
- * them. Feature nouns are not deploys: "push notifications", "release
+/** Git push is standing policy; deployment still needs task authorization.
+ * Feature nouns are not deploys: "push notifications", "release
  * build/APK/variant/notes", "deployment docs" stay routine. */
 const DEPLOY_TOPIC =
   /\b(re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?\b(?!\s+(?:script|docs?|documentation)\b)|push(?:es|ed|ing)?\b(?!\s+(?:notifications?|messages?|tokens?|providers?|services?|payloads?)\b)|publish\w*|releas(?:e|es|ed|ing)\b(?!\s+(?:builds?|variants?|apks?|aabs?|notes|mode|config\w*|signing|types?)\b)|prod|production|go(?:es|ing)? live|app store|play store|testflight)\b/i;
 const LOCAL_TARGET = /\b(?:emulator|simulator|localhost|local\s+(?:main|branch|repo\w*|checkout|worktree))\b/i;
 
-export type QuestionClass = "routine" | "irreversible" | "deploy-allowed";
+export type QuestionClass = "routine" | "irreversible" | "push-allowed" | "deploy-allowed";
 
 export interface QuestionTriage {
   class: QuestionClass;
@@ -580,15 +581,15 @@ export function triageQuestion(question: string, deployRequested: boolean, decla
     }
   }
   if (deploy) {
-    // Standing policy: a plain `git push origin` (not force) after a green merge
-    // is always allowed. Real deploy/release/prod/store actions still need the
+    // Standing policy: publish the verified candidate (never force), unless the
+    // task explicitly says no-push/local-only. Real deploy/release/prod/store actions still need the
     // task to have asked for a deploy.
     const pushOnly = !/\b(?:re-?deploy(?:s|ed|ing)?|deploy(?:s|ed|ing)?\b(?!\s+(?:script|docs?|documentation)\b)|publish\w*|releas(?:e|es|ed|ing)\b(?!\s+(?:builds?|variants?|apks?|aabs?|notes|mode|config\w*|signing|types?)\b)|prod|production|go(?:es|ing)?\s+live|app\s+store|play\s+store|testflight)\b/i.test(text);
     if (pushOnly) {
-      return { class: "deploy-allowed", reason: "push after green merge is standing policy" };
+      return { class: "push-allowed", reason: "push after green merge is standing policy" };
     }
     return deployRequested
-      ? { class: "deploy-allowed", reason: "deploy/push requested by the task" }
+      ? { class: "deploy-allowed", reason: "deploy/release requested by the task" }
       : { class: "irreversible", reason: "deploy not requested by the task" };
   }
   if (declared === "irreversible") return { class: "irreversible", reason: "declared irreversible by the worker" };
@@ -604,7 +605,7 @@ export function classifyQuestion(question: string, deployRequested: boolean, dec
 export const FINISHED_WORKFLOW_STATUSES = ["merged-to-main", "delivered"] as const;
 
 /** Whether a feature task may close: the workflow merged to local main
- * (Deliver always pushes origin main), and status "delivered" when the task
+ * (Deliver publishes unless the task opts out), and status "delivered" when the task
  * also asked for a deploy. */
 export function featureDoneAllowed(status: string | null, deployRequested: boolean): boolean {
   if (status === null) return false;
@@ -734,10 +735,13 @@ export interface WorkerPlan {
 export const QUESTION_HANDOFF = 'Do not call chief_of_staff_ask. When genuinely blocked, call chief_of_staff_report with stage "blocked" and a note whose first line is exactly: QUESTION: #<task> [irreversible|routine] thread=<your BB thread id> run=<workflow run id or none> | <question> | options: <A> / <B> / <C>. Also post the same text as a Vikunja comment if available. Then STOP and leave the run parked until Denis or his assistant answers via bb thread tell. Silence, errors, timeouts and generic nudges never authorize an option. Report progress with ANSWERED: #<task> <chosen option> before continuing. If a routine choice can safely be made without asking, use best judgment and note it instead.';
 
 function deployRule(plan: WorkerPlan): string {
-  return plan.deployRequested
-    ? "- Push/deploy: after a green merge to local main, ALWAYS `git push origin main` (never force) — standing policy. This task ALSO asks for a deploy/release: use the documented deploy procedure for the affected area only, after the push."
-    : "- Push: after a green merge to local main, ALWAYS `git push origin main` (never force) — standing policy (Denis, Oct 2026). Deploy/release to production/staging/stores: this task does NOT ask for one, so do not deploy. If you believe a deploy is needed, use the QUESTION handoff below and wait.";
+  const push = "- Push: publish the exact verified candidate SHA to origin/main (never force), unless the task explicitly says no-push or local-only. Verify the remote ref matches that SHA. Git publication is not deployment authorization.";
+  return push + (plan.deployRequested
+    ? " This task ALSO asks for a deploy/release: use the documented deploy procedure for the affected area only, after authorized publication."
+    : " Deploy/release to production/staging/stores: this task does NOT ask for one, so do not deploy. If you believe a deploy is needed, use the QUESTION handoff below and wait.");
 }
+
+const PUBLICATION_RECOVERY_RULE = '- Publication-only recovery: status "publication-failed" / nextAction "retry-publication" preserves the verified candidate; finalAcceptance:"passed" does not mean publication succeeded. Report the exact blocker and keep the saved receipt and publicationCommit. For a transient or uncertain transport outcome only, while admitted and not paused, start at most ONE fresh workflow run from the exact args of the failed run (including continuation/approval fields), adding only retryPublication:true and publicationCommit:<exact result SHA>. Never use cached --resume or reconstruct a missing receipt. The publisher checks the remote outcome before retrying and runs no Spec, Build, review, checks, merge, or deploy. Credential/refusal/divergence/hold failures, missing receipts, changed candidate/main/context/origin, dirty trees, and another failed retry stay blocked; never force-push, merge new code unattended, replay Build, or ask for fresh Spec to solve publication. Status "publication-held" stays parked under the task restriction. Status "publication-complete" / nextAction "deploy" means publication succeeded but deployment is still pending, not delivered: use only a separately documented deployment path already authorized by the task, otherwise report that blocker. Never infer deployment permission from publication.';
 
 const REVERSIBILITY_RULES = [
   "- Reversible work needs no approval: code, docs, tests, local commits, and merging into LOCAL main once everything passes. Do it without asking.",
@@ -755,8 +759,9 @@ export function operatingRules(plan: WorkerPlan): string[] {
   ];
   if (plan.mode === "feature") {
     return [
-      `- This is a FEATURE: it ships through the \`${plan.workflowName}\` bb workflow, not by hand. Do not write app code, create branches, merge, or push yourself; the workflow owns spec, build, verify, merge to local main, push origin main${plan.deployRequested ? ", and deploy" : ""}.`,
+      `- This is a FEATURE: it ships through the \`${plan.workflowName}\` bb workflow, not by hand. Do not write app code, create branches, merge, or push yourself; the workflow owns spec, build, verify, merge to local main, publication of the verified SHA unless explicitly no-push/local-only${plan.deployRequested ? ", and deploy" : ""}.`,
       `- Manager adoption exception: if YOU fix process / lane-ownership / shared Makefile|tools|.bb review findings on the integration branch yourself, the NEXT workflow run MUST be continueRepair:true with the SAME specRound (re-verify/re-review). Never launch a fresh Codex Spec solely because the manager patched those findings.`,
+      PUBLICATION_RECOVERY_RULE,
       ...common,
       `- "done" is accepted only after the workflow returns status ${plan.deployRequested ? '"delivered"' : '"merged-to-main"'}; pass workflowRunId and workflowStatus in the report.`,
     ];
@@ -764,7 +769,7 @@ export function operatingRules(plan: WorkerPlan): string[] {
   return [
     '- Kanban: report "progress" with phase "verifying" when the change is written and you are running the tests/review, and phase "building" if that sends you back to fixing; the card moves Doing → Testing → Done with it.',
     "- Work in this thread's own bb worktree branch; never edit, stash, or commit in the shared main checkout (the first entry of `git worktree list --porcelain`).",
-    "- When make test-<app> and make lint are green, merge your branch into local main: `git -C <main checkout> merge --no-ff <branch>`, only if that checkout is on main and the merge touches no locally modified file; otherwise report blocked. Then ALWAYS `git -C <main checkout> push origin main` (never force) — standing policy.",
+    "- " + PLAIN_TASK_MERGE_RULE,
     ...common,
   ];
 }
@@ -1035,6 +1040,7 @@ export function buildWorkerPrompt(
       `   - status "lane-less-blocked" or legacy "nothing-to-build": report "blocked" with the reason. No app lanes is not completion: documentation must still be implemented, independently checked and merged. Do not rerun a fresh Spec blindly or mark the task done.`,
       `   - nextAction "resume-final-candidate": lane work is complete but final acceptance is PENDING, NOT delivered. Start ONE fresh run from the exact args of the run that timed out (including its continuation/approval fields), adding only resumeFinalCandidate:true. Do NOT use cached --resume, reconstruct a missing checkpoint, replay Build or drop final gates. If paused, do not launch anything until explicitly resumed.`,
       `   - status "candidate-checkpoint-invalid": report "blocked" with its exact reason and stop. Never fall back to Build or a fresh Spec automatically.`,
+      `   - status "publication-failed" / nextAction "retry-publication", "publication-held", or "publication-complete" / nextAction "deploy": follow the publication-only recovery rule below, before any generic fallback. Preserve the verified result; never treat these as code-repair or fresh-Spec requests, and never report done while publication or requested deployment is pending.`,
       `   - status "queue-timeout" with nextAction "rerun" only: start ONE fresh run with the same args as that run (same specRound), only while admitted and not paused. Never claim this timeout delivered anything.`,
       `   - nextAction "continue-repair" (or status "partial" with repairIssues, or status "main-merge-failed" with mergeConflict / nextAction continue-repair, or after YOU as manager adopted/fixed process or lane-ownership review findings on the integration branch): DO NOT launch a fresh Spec and DO NOT stuff findings into a new brief. Write ${argsFile.replace(".json", "-continue.json")} from the frozen args plus continueRepair:true, repairIssues from the result (map of app -> finding strings; after manager adoption, list the findings you just closed / "re-verify manager adoption on integration"), and the SAME specRound; when the result has mergeConflict or mergeConflictRepair, ALSO set mergeConflictRepair:true and copy mergeConflict from the result. Run bb workflows run --name ${plan.workflowName} --args "$(cat that file)". Resume on the existing branch: review findings → repair→verify→review; main-merge conflict → resolve on integration + re-checks; manager-adopted process MAJORs → re-verify/re-review only (no lane rebuild, no fresh Spec).`,
       `   - status "spec-rounds-exhausted" (nextAction "pause"): already used 3 fresh Spec launches for this ticket. Report "blocked", surface remaining MAJORs (result.report + repairIssues) through the QUESTION handoff; do NOT burn another Spec. Options: continueRepair on the existing branch if findings are repairable, hand to Denis, or cancel.`,
@@ -1064,9 +1070,9 @@ export function workerInstructions(taskTitle: string, mode: TaskMode = "task"): 
     "You are working a Chief of Staff task:",
     JSON.stringify(taskTitle),
     QUESTION_HANDOFF,
-    'Reversible work (code, docs, tests, local commits, merge to LOCAL main, and the standing `git push origin main` after a green merge) needs no approval. Irreversible or high-impact actions (deleting data, destructive migrations, secrets, paid actions, external messages, production/deploy the task did not ask for) need the QUESTION handoff with kind "irreversible" and an explicit yes — never proceed on a dismissal or timeout.',
+    'Reversible work (code, docs, tests, local commits, merge to LOCAL main, and publication of the exact verified candidate SHA unless the task explicitly says no-push or local-only) needs no approval. Irreversible or high-impact actions (deleting data, destructive migrations, secrets, paid actions, external messages, production/deploy the task did not ask for) need the QUESTION handoff with kind "irreversible" and an explicit yes — never proceed on a dismissal or timeout.',
     mode === "feature"
-      ? "This is a feature task: it ships through the feature-delivery workflow; report done only with the workflow's final workflowStatus."
+      ? "This is a feature task: it ships through the feature-delivery workflow; report done only with the workflow's final workflowStatus. Publication failure preserves the verified candidate: park actionable blockers, or use at most one admitted publication-only retry with exact last-run args plus retryPublication:true and publicationCommit from the result. Never replay Build, start fresh Spec, or deploy to fix publication; paused tasks wait."
       : "Make safe routine choices without blocking; after posting a QUESTION, wait for an explicit answer.",
   ].join("\n");
 }

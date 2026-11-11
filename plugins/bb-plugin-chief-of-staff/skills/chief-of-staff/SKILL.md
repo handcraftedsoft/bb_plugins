@@ -40,6 +40,20 @@ Use a fresh workflow with the exact last-run args plus `resumeFinalCandidate:tru
 cached `--resume`, Build replay or reconstructed evidence. `candidate-checkpoint-invalid`
 stays blocked for inspection. While paused, even this recovery waits for explicit resume.
 
+For `publication-failed` / `nextAction=retry-publication`, preserve the saved receipt,
+verified candidate and exact `publicationCommit`; `finalAcceptance=passed` is not
+publication success. Park credential, refusal, divergence, hold, missing receipt,
+changed main/candidate/context/origin, and dirty-tree failures with their exact reason.
+For a transient/uncertain transport failure only, while admitted and not paused, start
+at most one fresh workflow with the exact failed-run args plus `retryPublication:true`
+and `publicationCommit` from the result. Do not use `--resume` or reconstruct receipts.
+The publisher checks the remote outcome first and runs only publication: no Spec,
+Build, review, checks, merge, or deploy. Another failure stays blocked, never force
+push or merge new code to bypass it. `publication-held` remains parked under the task
+restriction. `publication-complete` / `nextAction=deploy` means deployment is still
+pending, not delivered; use only an existing documented, task-authorized deployment
+path or report the missing path. A push never authorizes deployment.
+
 Do not use `chief_of_staff_ask` for new worker questions: its long-held connection
 is unreliable. Report stage `blocked` with a first line of:
 `QUESTION: #<task> [irreversible|routine] thread=<thread id> run=<run id or none> | <question> | options: <A> / <B> / <C>`.
@@ -123,12 +137,25 @@ Operating constraints:
   a deploy" means an explicit `Deploy: yes` / `Ship: yes` line or a clear
   affirmative ("and deploy to prod"); `Deploy: no`, negations and bare
   mentions ("deploy script", "push notifications") mean NO — write
-  `Deploy: no` / `Deploy: yes` in task descriptions to be unambiguous. At most
+  `Deploy: no` / `Deploy: yes` in task descriptions to be unambiguous. A negated
+  deployment overrides even `Deploy: yes`. `Push: yes`, `publishRequested: true`,
+  and pushing to origin/main/remote/GitHub never authorize deployment. At most
   `maxFeatureRuns` (default 1) feature runs at once; the workflow also enforces
   its configured atomic slot cap and resource leases, so a run in phase `Queue` ("queued
   behind <run id>") is waiting normally and must not be restarted. Other tasks get a plain
-  implementer (ZCode GLM-5.3) that merges its worktree branch into local main
-  once tests pass.
+  implementer (ZCode GLM-5.3). Commit the final candidate with current main
+  included in the worker's own worktree, confirm a clean worktree, record its
+  immutable SHA, and run the required gates on that exact SHA. Only `merge --ff-only <verified-sha>`
+  into main when it has not moved and no local edits are touched; never create
+  another merge commit after verification. Candidate/main changes require
+  preparation and verification again. Unless the task explicitly says no-push
+  or local-only, push `<verified-sha>:refs/heads/main` (never force) and verify
+  the remote ref equals that SHA. A rejected push stays blocked.
+- **Tests:** follow `rateyourfood-test-budget` in rateyourfood. Reuse meaningful
+  existing coverage, extend the nearest case for a concrete uncovered failure,
+  and choose the cheapest valid layer. Do not add tests for quotas, coverage
+  percentages, or assertions proving only mocks. Focused iteration does not
+  replace the required final-candidate acceptance gates.
 - **Reversible vs irreversible:** code, docs, tests, local commits and merging
   into local main need no approval. Irreversible/high-impact questions
   (deleting data, destructive migrations, force-push, secrets, spending money,
@@ -137,8 +164,9 @@ Operating constraints:
   policies, wait for
   Denis without a timeout, and a dismissal means **no**
   (`chief_of_staff_ask` with `kind: "irreversible"`, also detected from the
-  question text). Plain `git push origin` after a green merge is standing policy
-  (always allowed). Deploy/release questions are auto-allowed only when the task
+  question text). Publishing the exact verified SHA is standing policy unless
+  the task explicitly says no-push or local-only. A Git push answer authorizes
+  only publication, not deployment. Deploy/release questions are auto-allowed only when the task
   text explicitly asked for a deploy/release. Detection is negation- and
   context-aware: "no DNS change", "don't spend", "without touching certs",
   reading DNS/certs and estimating cost are routine; genuinely ambiguous DNS,
