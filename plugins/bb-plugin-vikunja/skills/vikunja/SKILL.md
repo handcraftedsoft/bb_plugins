@@ -40,3 +40,12 @@ Configure the HTTPS MCP endpoint and token in Settings → Plugins → Vikunja.
 Changing settings takes effect on the next request; Docker is not a runtime dependency.
 The existing token may allow tasks but deny board access; change its permissions in Vikunja
 or create an appropriate token to enable board reads and moves. Never print tokens.
+
+Select Burndown in the sidebar View menu for a lifetime chart of the current project,
+from its earliest available task update through today in the browser timezone.
+It loads every project-task page, including done tasks, and shows remaining work
+and total scope. Creation/completion timestamps reconstruct daily totals; this is
+not audit history and excludes deleted tasks and earlier reopenings. Missing dates
+are labeled as estimates. Hover or use the date slider/data table to inspect points.
+No task is changed by viewing the chart. A failed page or the 200-page safety cap
+shows an error instead of partial data. Refresh updates the chart through today.

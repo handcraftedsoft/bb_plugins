@@ -43,3 +43,34 @@ test('a slow previous project response cannot overwrite the newly selected board
     await waitFor(() => { expect(slot.queryByText('Keep this card')).toBeNull(); expect(slot.getByText('Other column')).toBeTruthy(); });
   } finally { release(board); slot.lifecycle.unmount(); }
 });
+test('Burndown is an alternative to Kanban and follows the selected project', async () => {
+  const burndown = vi.fn().mockResolvedValue({ start: '2026-10-02', end: '2026-11-09', taskCount: 2, missingDates: 0, estimatedCompletions: 0, points: [{ date: '2026-10-02', total: 2, remaining: 2 }, { date: '2026-11-09', total: 2, remaining: 1 }] });
+  const slot = await mount({ burndown });
+  try {
+    await slot.findByRole('region', { name: 'Kanban board' });
+    fireEvent.change(slot.getByLabelText('View'), { target: { value: '-1' } });
+    await slot.findByRole('img', { name: 'Lifetime task burndown' });
+    expect(burndown).toHaveBeenCalledWith({ project: 6, timezone: expect.any(String) });
+    expect(slot.queryByRole('region', { name: 'Kanban board' })).toBeNull();
+    fireEvent.change(slot.getByLabelText('View'), { target: { value: '24' } });
+    await slot.findByRole('region', { name: 'Kanban board' });
+  } finally { slot.lifecycle.unmount(); }
+});
+test('Burndown stays selected when changing projects and ignores a late prior response', async () => {
+  let release!: (value: unknown) => void;
+  const pending = new Promise(resolve => { release = resolve; });
+  const burndown = vi.fn((input: any) => input.project === 6 ? pending : Promise.resolve({ start: null, end: '2026-11-09', taskCount: 0, missingDates: 0, estimatedCompletions: 0, points: [] }));
+  const slot = await mount({
+    call: () => ({ items: [project, { id: 5, title: 'Other', views: [{ id: 20, title: 'Kanban', view_kind: 'kanban' }] }], total_pages: 1 }),
+    burndown,
+  });
+  try {
+    await slot.findByRole('region', { name: 'Kanban board' });
+    fireEvent.change(slot.getByLabelText('View'), { target: { value: '-1' } });
+    fireEvent.change(slot.getByLabelText('Project'), { target: { value: '5' } });
+    await slot.findByText(/No tasks yet. The lifetime burndown/);
+    release({ start: '2026-10-02', end: '2026-11-09', taskCount: 1, missingDates: 0, estimatedCompletions: 0, points: [{ date: '2026-11-09', total: 1, remaining: 1 }] });
+    await waitFor(() => { expect(slot.queryByRole('img', { name: 'Lifetime task burndown' })).toBeNull(); });
+    expect(burndown).toHaveBeenCalledWith({ project: 5, timezone: expect.any(String) });
+  } finally { release({}); slot.lifecycle.unmount(); }
+});
