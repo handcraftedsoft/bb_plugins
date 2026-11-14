@@ -27,6 +27,8 @@
     "lib",
     "hooks",
     "client.ts",
-    "kanban.tsx"
+    "kanban.tsx",
+    "burndown.ts",
+    "burndown-chart.tsx"
   ]
 }

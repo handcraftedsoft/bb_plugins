@@ -1,11 +1,13 @@
 import { defineRpcContract, type BbPluginApi } from '@get-bb/plugin-sdk';
 import { z } from 'zod';
 import { VikunjaClient, endpoint, bounded } from './client';
+import { burndownSchema, loadBurndown, timezoneSchema } from './burndown';
 const id = z.number().int().positive();
 const args = z.record(z.string(), z.unknown());
 const callInput = z.object({ name: z.string().regex(/^[a-zA-Z0-9_]+$/), arguments: args });
 export const rpcContract = defineRpcContract({
   call: { input: callInput, output: z.unknown() },
+  burndown: { input: z.object({ project: id, timezone: timezoneSchema }), output: burndownSchema },
   tools: { input: z.null(), output: z.unknown() },
   board: { input: z.object({ project: id, view: id }), output: z.unknown() },
   buckets: { input: z.object({ project: id, view: id }), output: z.unknown() },
@@ -33,6 +35,7 @@ export default async function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set(`task:${task}`, next); return next;
   }
   bb.rpc.register(rpcContract, {
+    burndown: ({ project, timezone }) => loadBurndown((name, args) => client.call(name, args), project, new Date(), timezone),
     call, tools: () => client.tools(),
     status: async () => { const c = await settings.get(); return { configured: !!c.token, origin: endpoint(c.endpoint).origin }; },
     board: ({ project, view }) => client.rest(`/projects/${project}/views/${view}/buckets/tasks?format=markdown`),
